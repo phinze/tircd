@@ -2,17 +2,13 @@
 # tircd - An ircd proxy to the twitter API
 # perldoc this file for more information.
 
-#TODO
-#fix JSON crash bug
-#malformed JSON string, neither array, object, number, string or atom, at character offset 0 ["<!DOCTYPE html PUBLI..."] at /Library/Perl/5.8.6/JSON/Any.pm line 483.
-#get new name
-
 use strict;
 use Net::Twitter;
 use Date::Manip;
 use POE qw(Component::Server::TCP Filter::Stackable Filter::IRCD);
+use Data::Dumper;
 
-my $VERSION = 0.1;
+my $VERSION = 0.2;
 
 #timing settings (how often we update the API) in seconds.  You want to ensure you don't end up with more than 100/hr calls to twitter
 my $delay_twitter_timeline = 180; #how often we check for @replies and the timeline (2 calls)
@@ -48,7 +44,10 @@ POE::Component::Server::TCP->new(
     twitter_timeline => \&twitter_timeline,
     twitter_direct_messages => \&twitter_direct_messages,
     
-    startitup => \&tircd_startitup
+    startitup => \&tircd_startitup,
+    getfriend => \&tircd_getfriend,
+    updatefriend => \&tircd_updatefriend
+    
   },
   ClientFilter		=> $filter, 
   ClientInput		=> \&irc_line,
@@ -58,6 +57,31 @@ print "$0: version $VERSION started.\n";
 
 $poe_kernel->run();                                                                
 exit 0; 
+
+#update a friend's info in the heap
+sub tircd_updatefriend {
+  my ($heap, $new) = @_[HEAP, ARG0];  
+
+  foreach my $friend (@{$heap->{'friends'}}) {
+    if ($friend->{'id'} == $new->{'id'}) {
+      $friend = $new;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+#check to see if a given friend exists, and return it
+sub tircd_getfriend {
+  my ($heap, $target) = @_[HEAP, ARG0];
+  
+  foreach my $friend (@{$heap->{'friends'}}) {
+    if ($friend->{'screen_name'} eq $target) {
+      return $friend;
+    }
+  }
+  return 0;
+}
 
 #called once we have a user/pass
 sub tircd_startitup {
@@ -263,15 +287,13 @@ sub irc_who {
   my $target = $data->{'params'}[0];
   if ($target =~ /^\#/) {
     if ($target eq '#twitter') {
-      foreach my $user (@{$heap->{'friends'}}) {
-        $kernel->yield('server_reply',352,$target,$user->{'screen_name'},'twitter','tircd',$user->{'screen_name'},'G',"0 $user->{'name'}");
+      foreach my $friend (@{$heap->{'friends'}}) {
+        $kernel->yield('server_reply',352,$target,$friend->{'screen_name'},'twitter','tircd',$friend->{'screen_name'},'G',"0 $friend->{'name'}");
       }
     }      
-  } else {
-    foreach my $user (@{$heap->{'friends'}}) {
-      if ($user->{'screen_name'} eq $target) {
-        $kernel->yield('server_reply',352,'*',$user->{'screen_name'},'twitter','tircd',$user->{'screen_name'},'G',"0 $user->{'name'}");
-      }
+  } else { #only support a ghetto version of /who right now, /who ** and what not won't work
+    if (my $friend = $kernel->call($_[SESSION],'getfriend',$target)) {
+        $kernel->yield('server_reply',352,'*',$friend->{'screen_name'},'twitter','tircd',$friend->{'screen_name'},'G',"0 $friend->{'name'}");
     }
   }
   $kernel->yield('server_reply',315,$target,'End of /WHO list'); 
@@ -282,38 +304,32 @@ sub irc_whois {
   my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
   my $target = $data->{'params'}[0];
   
-  my $user;
-  my $isfriend = 0;
-  foreach my $friend (@{$heap->{'friends'}}) {
-    if ($friend->{'screen_name'} eq $target) {
-      $user = $friend;
-      $isfriend = 1;
-      last;
-    }
+  my $friend = $kernel->call($_[SESSION],'getfriend',$target);
+  my $isfriend = 1;
+  
+  if (!$friend) {#if we don't have their info already try to get it from twitter, and track it for the end of this function
+    $friend = $heap->{'twitter'}->show_user($target);
+    $isfriend = 0;
   }
   
-  if (!$user) {#if we don't have their info already try to get it from twitter
-    $user = $heap->{'twitter'}->show_user($target);
-  }
-  
-  if ($user) {
-    $kernel->yield('server_reply',311,$target,$target,'twitter','*',$user->{'name'});
+  if ($friend) {
+    $kernel->yield('server_reply',311,$target,$target,'twitter','*',$friend->{'name'});
     
     #send a bunch of 301s to convey all the twitter info, not sure if this is totally legit, but the clients I tested with seem ok with it
-    if ($user->{'location'}) {
-      $kernel->yield('server_reply',301,$target,"Location: $user->{'location'}");
+    if ($friend->{'location'}) {
+      $kernel->yield('server_reply',301,$target,"Location: $friend->{'location'}");
     }
 
-    if ($user->{'url'}) {
-      $kernel->yield('server_reply',301,$target,"Web: $user->{'url'}");
+    if ($friend->{'url'}) {
+      $kernel->yield('server_reply',301,$target,"Web: $friend->{'url'}");
     }
 
-    if ($user->{'description'}) {
-      $kernel->yield('server_reply',301,$target,"Bio: $user->{'description'}");
+    if ($friend->{'description'}) {
+      $kernel->yield('server_reply',301,$target,"Bio: $friend->{'description'}");
     }
 
-    if ($user->{'status'}->{'text'}) {
-     $kernel->yield('server_reply',301,$target,"Last Update: $user->{'status'}->{'text'}");
+    if ($friend->{'status'}->{'text'}) {
+     $kernel->yield('server_reply',301,$target,"Last Update: $friend->{'status'}->{'text'}");
     }
 
     if ($target eq $heap->{'username'}) { #if it's us, then add the rate limit info to
@@ -323,26 +339,25 @@ sub irc_whois {
 
     #treat their twitter client as the server
     my $server; my $info;
-    if ($user->{'status'}->{'source'} =~ /\<a href="(.*)"\>(.*)\<\/a\>/) {
+    if ($friend->{'status'}->{'source'} =~ /\<a href="(.*)"\>(.*)\<\/a\>/) { #not sure this regex will work in all cases
       $server = $2;
       $info = $1;
     } else {
       $server = 'web';
       $info = 'http://www.twitter.com/';
     }
-    
     $kernel->yield('server_reply',312,$target,$server,$info);
     
     #set their idle time, to the time since last message (if we have one, the api won't return the most recent message for users who haven't updated in a long time)
     my $diff;
-    if ($user->{'status'}->{'created_at'}) {
-      my $date = UnixDate(ParseDate($user->{'status'}->{'created_at'}),'%s');
+    if ($friend->{'status'}->{'created_at'}) {
+      my $date = UnixDate(ParseDate($friend->{'status'}->{'created_at'}),'%s');
       $diff = time()-$date;
     } else {
       $diff = 0;
     }
-   
     $kernel->yield('server_reply',317,$target,$diff,'seconds idle');
+
     if ($isfriend) {
       $kernel->yield('server_reply',319,$target,'#twitter ');
     }
@@ -362,24 +377,22 @@ sub irc_privmsg {
       $kernel->yield('server_reply',404,$target,'Cannot send to channel');
       return;
     }
+
     #in a channel, this an update
     my $update = $heap->{'twitter'}->update($msg);
     $msg = $update->{'text'};
     
     #update our own friend record
-    foreach my $user (@{$heap->{'friends'}}) {
-      if ($user->{'screen_name'} eq $heap->{'username'}) {
-        $user = $update->{'user'};
-        $user->{'status'} = $update;
-        last;
-      }
-    }
+    my $me = $kernel->call($_[SESSION],'getfriend',$heap->{'username'});
+    $me = $update->{'user'};
+    $me->{'status'} = $update;
+    $kernel->call($_[SESSION],'updatefriend',$me);
     
     #keep the topic updated with our latest tweet  
     $kernel->yield('user_msg','TOPIC',$heap->{'username'},$target,"$heap->{'username'}'s last update: $msg");
   } else { 
     #private message, it's a dm
-    my $dm = $heap->{'twitter'}->new_direct_message({user => $target, text =>  $msg});
+    my $dm = $heap->{'twitter'}->new_direct_message({user => $target, text => $msg});
     if (!$dm) {
       $kernel->yield('server_reply',401,$target,"Unable to send direct message.  Perhaps $target isn't following you?");
     }
@@ -397,11 +410,9 @@ sub irc_invite {
     return;
   }
 
-  foreach my $friend (@{$heap->{'friends'}}) {
-    if ($friend->{'screen_name'} eq $target) {
-      $kernel->yield('server_reply',443,$target,$chan,'is already on channel');
-      return;
-    }
+  if ($kernel->call($_[SESSION],'getfriend',$target)) {
+    $kernel->yield('server_reply',443,$target,$chan,'is already on channel');
+    return;
   }
 
   my $user = $heap->{'twitter'}->create_friend({id => $target});
@@ -433,15 +444,7 @@ sub irc_kick {
     return;
   }
   
-  my $found = 0;
-  foreach my $friend (@{$heap->{'friends'}}) {
-    if ($friend->{'screen_name'} eq $target) {
-      $found = 1;
-      last;
-    }
-  }
-  
-  if (!$found) {
+  if (!$kernel->call($_[SESSION],'getfriend',$target)) {
     $kernel->yield('server_reply',441,$target,$chan,"They aren't on that channel");
     return;
   }
@@ -468,40 +471,10 @@ sub twitter_timeline {
 
   #sometimes the twitter API returns undef, so we gotta check here
   if (!$timeline || @$timeline == 0) {
-    $kernel->delay('twitter_timeline',$delay_twitter_timeline);
-    return;
-  }
-
-  #if we got new data save our position, and then flip the array, so the oldest messages are at the top
-  $heap->{'timeline_since_id'} = @{$timeline}[0]->{'id'};
-  my @timeline = reverse(@{$timeline});
-  $timeline = \@timeline;
-
-  #loop through each message
-  foreach my $item (@{$timeline}) {
-    my $found = 0;
-    foreach my $user (@{$heap->{'friends'}}) {
-      if ($user->{'id'} == $item->{'user'}->{'id'}) {
-        $found = 1;
-        $user = $item->{'user'};
-        $user->{'status'} = $item;
-        last;
-      }
-    }
-
-    #If this is a new user, add them to our list and fake a JOIN before showing their message
-    #don't show our own messages as they are probably in the window already
-    if (!$found) {
-      my $tmp = $item->{'user'};
-      $tmp->{'status'} = $item;
-      push(@{$heap->{'friends'}},$tmp);
-      if ($item->{'user'}->{'screen_name'} ne $heap->{'username'}) {
-        $kernel->yield('user_msg','JOIN',$item->{'user'}->{'screen_name'},'#twitter');
-      }
-    }
-    if ($item->{'user'}->{'screen_name'} ne $heap->{'username'}) {
-      $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},'#twitter',$item->{'text'});
-    }
+    $timeline = [];
+  } else {
+    #if we got new data save our position
+    $heap->{'timeline_since_id'} = @{$timeline}[0]->{'id'};
   }
 
   #get updated @replies too
@@ -512,56 +485,37 @@ sub twitter_timeline {
     $replies = $heap->{'twitter'}->replies({page =>1}); #avoid a bug in Net::Twitter
   }
 
-  #check for undef
   if (!$replies || @$replies == 0) {
-    $kernel->delay('twitter_timeline',$delay_twitter_timeline);
-    return;
-  }  
-
-  #if we got new data save our position, and then flip the array, so the oldest messages are at the top
-  $heap->{'replies_since_id'} = @{$replies}[0]->{'id'};
-  my @replies = reverse(@{$replies});
-  $replies = \@replies;
-
+    $replies = [];
+  } else {  
+    $heap->{'replies_since_id'} = @{$replies}[0]->{'id'};
+  }
+  
+  #weave the two arrays together into one stream, removing duplicates
+  my @tmpdata = (@{$timeline},@{$replies});
+  my %tmphash = ();
+  foreach my $item (@tmpdata) {
+    $tmphash{$item->{'id'}} = $item;
+  }
+  
   #loop through each message
-  foreach my $item (@{$replies}) {
-    #make sure we didn't print the @reply in the timeline code above
-    my $dupe = 0;
-    foreach my $tmpitem (@{$timeline}) {
-      if ($item->{'id'} == $tmpitem->{'id'}) {
-         $dupe = 1;
-         last; 
-      }
-    }
-    last if $dupe;
-
-    my $found = 0;
-    foreach my $user (@{$heap->{'friends'}}) {
-      if ($user->{'id'} == $item->{'user'}->{'id'}) {
-        $found = 1;
-        if ($item->{'id'} > $user->{'status'}->{'id'}) { #update their most recent status to the @ if needed
-          $user = $item->{'user'};
-          $user->{'status'} = $item;
-        }
-        last;
-      }
-    }
-
-    #If this is a new user, add them to our list and fake a JOIN before showing their message
-    #don't show our own messages as they are probably in the window already
-    if (!$found) {
-      my $tmp = $item->{'user'};
-      $tmp->{'status'} = $item;
+  foreach my $item (sort {$a->{'id'} <=> $b->{'id'}} values %tmphash) {
+    my $tmp = $item->{'user'};
+    $tmp->{'status'} = $item;
+    
+    if (my $friend = $kernel->call($_[SESSION],'getfriend',$item->{'user'}->{'screen_name'})) { #if we've seen 'em before just update our cache
+      $kernel->call($_[SESSION],'updatefriend',$tmp);
+    } else { #if it's a new user, add 'em to the cache / and join 'em
       push(@{$heap->{'friends'}},$tmp);
-      if ($item->{'user'}->{'screen_name'} ne $heap->{'username'}) {
-        $kernel->yield('user_msg','JOIN',$item->{'user'}->{'screen_name'},'#twitter');
-      }
+      $kernel->yield('user_msg','JOIN',$item->{'user'}->{'screen_name'},'#twitter');
     }
+    
+    #filter out our own messages
     if ($item->{'user'}->{'screen_name'} ne $heap->{'username'}) {
       $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},'#twitter',$item->{'text'});
     }
   }
-  
+
   $kernel->delay('twitter_timeline',$delay_twitter_timeline);
 }
 
@@ -577,24 +531,13 @@ sub twitter_direct_messages {
   }
 
   if (!$data || @$data == 0) {
-    $kernel->delay('twitter_direct_messages',$delay_twitter_direct_messages);
-    return;
+    $data = [];
+  } else {
+    $heap->{'direct_since_id'} = @{$data}[0]->{'id'};
   }
 
-  $heap->{'direct_since_id'} = @{$data}[0]->{'id'};
-
-  my @data = reverse(@{$data});
-  $data = \@data;
-  
-  foreach my $item (@{$data}) {
-    my $found = 0;
-    foreach my $user (@{$heap->{'friends'}}) {
-      if ($user->{'id'} == $item->{'sender'}->{'id'}) {
-        $found = 1;
-        last;
-      }
-    }
-    if (!$found) { #new user
+  foreach my $item (sort {$a->{'id'} <=> $b->{'id'}} @{$data}) {
+    if (!$kernel->call($_[SESSION],'getfriend',$item->{'sender'}->{'screen_name'})) {
       my $tmp = $item->{'sender'};
       $tmp->{'status'} = $item;
       $tmp->{'status'}->{'text'} = '(dm) '.$tmp->{'status'}->{'text'};
