@@ -501,7 +501,7 @@ sub twitter_timeline {
   foreach my $item (@tmpdata) {
     $tmphash{$item->{'id'}} = $item;
   }
-  
+
   #loop through each message
   foreach my $item (sort {$a->{'id'} <=> $b->{'id'}} values %tmphash) {
     my $tmp = $item->{'user'};
