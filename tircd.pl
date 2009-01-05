@@ -6,7 +6,6 @@ use strict;
 use Net::Twitter;
 use Date::Manip;
 use POE qw(Component::Server::TCP Filter::Stackable Filter::IRCD);
-use Data::Dumper;
 
 my $VERSION = 0.2;
 
