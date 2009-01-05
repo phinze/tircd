@@ -50,6 +50,7 @@ POE::Component::Server::TCP->new(
   },
   ClientFilter		=> $filter, 
   ClientInput		=> \&irc_line,
+  ClientDisconnected	=> \&tircd_cleanup
 );    
 
 print "$0: version $VERSION started.\n";
@@ -109,6 +110,10 @@ sub tircd_startitup {
 
   #show 'em the motd
   $kernel->yield('MOTD');  
+}
+
+sub tircd_cleanup {
+  $_[KERNEL]->yield('shutdown');
 }
 
 #called everytime we get a line from an irc server
