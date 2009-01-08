@@ -207,7 +207,7 @@ sub tircd_login {
 
   #start up the twitter interface, and see if we can connect with the given NICK/PASS INFO
   my $twitter = Net::Twitter->new(username => $heap->{'username'}, password => $heap->{'password'}, source => 'tircd');
-  if (!$twitter->verify_credentials()) {
+  if (!eval { $twitter->verify_credentials() }) {
     $kernel->post('logger','log','Unable to login to Twitter with the supplied credentials.',$heap->{'username'});
     $kernel->yield('server_reply',462,'Unable to login to Twitter with the supplied credentials.');
     $kernel->yield('shutdown'); #disconnect 'em if we cant
@@ -353,7 +353,7 @@ sub irc_join {
   #get list of friends
   my @friends = ();
   my $page = 1;  
-  while (my $f = $heap->{'twitter'}->friends({page => $page})) {
+  while (my $f = eval { $heap->{'twitter'}->friends({page => $page}) }) {
     last if @$f == 0;    
     push(@friends,@$f);
     $page++;
@@ -368,7 +368,7 @@ sub irc_join {
   #get list of friends
   my @followers = ();
   my $page = 1;  
-  while (my $f = $heap->{'twitter'}->followers({page => $page})) {
+  while (my $f = eval { $heap->{'twitter'}->followers({page => $page}) }) {
     last if @$f == 0;    
     push(@followers,@$f);
     $page++;
@@ -406,7 +406,7 @@ sub irc_join {
   
   if (!$lastmsg) { #if we aren't already in the list, add us to the list for NAMES - AND go grab one tweet to put us in the array
     unshift(@users, $heap->{'username'});
-    my $data = $heap->{'twitter'}->user_timeline({count => 1});
+    my $data = eval { $heap->{'twitter'}->user_timeline({count => 1}) };
     if ($data && @$data > 0) {
       $kernel->post('logger','log','Received user timeline from Twitter.',$heap->{'username'});
       my $tmp = $$data[0]->{'user'};
@@ -462,7 +462,7 @@ sub irc_mode { #ignore all mode requests (send back the appropriate message to k
     if ($mode eq 'b') {
       $kernel->yield('server_reply',368,$target,'End of channel ban list');
     } elsif ($mode eq '+b') {
-      my $user = $heap->{'twitter'}->create_block($nick);
+      my $user = eval { $heap->{'twitter'}->create_block($nick) };
       if ($user) {
         $kernel->yield('user_msg','MODE',$heap->{'username'},$target,$mode,$opts);
       } else {
@@ -473,7 +473,7 @@ sub irc_mode { #ignore all mode requests (send back the appropriate message to k
         }
       }        
     } elsif ($mode eq '-b') {
-      my $user = $heap->{'twitter'}->destroy_block($nick);
+      my $user = eval { $heap->{'twitter'}->destroy_block($nick) };
       if ($user) {
         $kernel->yield('user_msg','MODE',$heap->{'username'},$target,$mode,$opts);
       } else {
@@ -525,7 +525,7 @@ sub irc_whois {
   my $isfriend = 1;
   
   if (!$friend) {#if we don't have their info already try to get it from twitter, and track it for the end of this function
-    $friend = $heap->{'twitter'}->show_user($target);
+    $friend = eval { $heap->{'twitter'}->show_user($target) };
     $isfriend = 0;
   }
   
@@ -555,7 +555,7 @@ sub irc_whois {
     }
 
     if ($target eq $heap->{'username'}) { #if it's us, then add the rate limit info to
-      my $rate = $heap->{'twitter'}->rate_limit_status();
+      my $rate = eval { $heap->{'twitter'}->rate_limit_status() };
       $kernel->yield('server_reply',301,$target,'API Usage: '.($rate->{'hourly_limit'}-$rate->{'remaining_hits'})." of $rate->{'hourly_limit'} calls used.");
       $kernel->post('logger','log','Current API usage: '.($rate->{'hourly_limit'}-$rate->{'remaining_hits'})." of $rate->{'hourly_limit'}",$heap->{'username'});
     }
@@ -606,7 +606,7 @@ sub irc_privmsg {
     }
 
     #in a channel, this an update
-    my $update = $heap->{'twitter'}->update($msg);
+    my $update = eval { $heap->{'twitter'}->update($msg) };
     $msg = $update->{'text'};
     
     #update our own friend record
@@ -620,7 +620,7 @@ sub irc_privmsg {
     $kernel->post('logger','log','Updated status.',$heap->{'username'});
   } else { 
     #private message, it's a dm
-    my $dm = $heap->{'twitter'}->new_direct_message({user => $target, text => $msg});
+    my $dm = eval { $heap->{'twitter'}->new_direct_message({user => $target, text => $msg}) };
     if (!$dm) {
       $kernel->yield('server_reply',401,$target,"Unable to send direct message.  Perhaps $target isn't following you?");
       $kernel->post('logger','log',"Unable to send direct message to $target",$heap->{'username'});
@@ -646,7 +646,7 @@ sub irc_invite {
     return;
   }
 
-  my $user = $heap->{'twitter'}->create_friend({id => $target});
+  my $user = eval { $heap->{'twitter'}->create_friend({id => $target}) };
   if ($user) {
     if (!$user->{'protected'}) {
       #if the user isn't protected, and we are following them now, then have 'em 'JOIN' the channel
@@ -687,7 +687,7 @@ sub irc_kick {
     return;
   }
 
-  my $result = $heap->{'twitter'}->destroy_friend($target);
+  my $result = eval { $heap->{'twitter'}->destroy_friend($target) };
   if ($result) {
     $kernel->call($_[SESSION],'remfriend',$target);
     $kernel->yield('user_msg','KICK',$heap->{'username'},$chan,$target,$target);
@@ -725,9 +725,9 @@ sub twitter_timeline {
   #get updated messages
   my $timeline;
   if ($heap->{'timeline_since_id'}) {
-    $timeline = $heap->{'twitter'}->friends_timeline({since_id => $heap->{'timeline_since_id'}});
+    $timeline = eval { $heap->{'twitter'}->friends_timeline({since_id => $heap->{'timeline_since_id'}}) };
   } else {
-    $timeline = $heap->{'twitter'}->friends_timeline();
+    $timeline = eval { $heap->{'twitter'}->friends_timeline() };
   }
 
   #sometimes the twitter API returns undef, so we gotta check here
@@ -745,9 +745,9 @@ sub twitter_timeline {
   #get updated @replies too
   my $replies;
   if ($heap->{'replies_since_id'}) {
-    $replies = $heap->{'twitter'}->replies({since_id => $heap->{'replies_since_id'}});
+    $replies = eval { $heap->{'twitter'}->replies({since_id => $heap->{'replies_since_id'}}) };
   } else {
-    $replies = $heap->{'twitter'}->replies({page =>1}); #avoid a bug in Net::Twitter
+    $replies = eval { $heap->{'twitter'}->replies({page =>1}) }; #avoid a bug in Net::Twitter
   }
 
   if (!$replies || @$replies == 0) {
@@ -794,9 +794,9 @@ sub twitter_direct_messages {
 
   my $data;
   if ($heap->{'direct_since_id'}) {
-    $data = $heap->{'twitter'}->direct_messages({since_id => $heap->{'direct_since_id'}});
+    $data = eval { $heap->{'twitter'}->direct_messages({since_id => $heap->{'direct_since_id'}}) };
   } else {
-    $data = $heap->{'twitter'}->direct_messages();
+    $data = eval { $heap->{'twitter'}->direct_messages() };
   }
 
   if (!$data || @$data == 0) {
