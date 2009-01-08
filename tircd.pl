@@ -8,7 +8,7 @@ use Date::Manip;
 use IO::File;
 use POE qw(Component::Server::TCP Filter::Stackable Filter::IRCD);
 
-my $VERSION = 0.3;
+my $VERSION = 0.4;
 
 #load and parse our own very simple config file
 #didn't want to introduce another module requirement to parse XML or a YAML file
@@ -23,9 +23,19 @@ while (<C>) {
 }
 close(C);
 
+#setup the timezone for Date::Manip if on windows
+if ($^O eq 'MSWin32') {
+  $ENV{'TZ'} = $config{'timzone'};
+}
+
 #setup our filter to process the IRC messages, jacked from the Filter:IRCD docs
 my $filter = POE::Filter::Stackable->new();
-$filter->push( POE::Filter::Line->new( InputRegexp => '\015?\012', OutputLiteral => "\015\012" ), POE::Filter::IRCD->new(debug => $config{'debug'}));
+$filter->push( POE::Filter::Line->new( InputRegexp => '\015?\012', OutputLiteral => "\015\012" ));
+if ($config{'debug'} > 1) {
+  $filter->push(POE::Filter::IRCD->new(debug => 1));
+} else {
+  $filter->push(POE::Filter::IRCD->new(debug => 0));
+}
 
 #if needed setup our logging sesstion
 if ($config{'logtype'} ne 'none') {
@@ -69,11 +79,13 @@ POE::Component::Server::TCP->new(
     login => \&tircd_login,
     getfriend => \&tircd_getfriend,
     remfriend => \&tircd_remfriend,
-    updatefriend => \&tircd_updatefriend
+    updatefriend => \&tircd_updatefriend,
+    getfollower => \&tircd_getfollower
     
   },
   ClientFilter		=> $filter, 
   ClientInput		=> \&irc_line,
+  ClientConnected    	=> \&tircd_connect,
   ClientDisconnected	=> \&tircd_cleanup,
   Started 		=> \&tircd_setup
 );    
@@ -84,7 +96,7 @@ exit 0;
 ########## STARTUP FUNCTIONS BEGIN
 
 sub tircd_setup {
-  $_[KERNEL]->call('logger','log',"tircd $VERSION started, listening on: $config{'address'}:$config{'port'}"); 
+  $_[KERNEL]->call('logger','log',"tircd $VERSION started, listening on: $config{'address'}:$config{'port'}."); 
 }
 
 #setup our logging session
@@ -124,10 +136,10 @@ sub twitter_api_error {
   my ($kernel,$heap, $msg) = @_[KERNEL, HEAP, ARG0];
   
   if ($config{'debug'}) {
-    print $heap->{'twitter'}->get_error;
+    $kernel->post('logger','log',$heap->{'twitter'}->http_message.' '.$heap->{'twitter'}->http_code.' '.$heap->{'twitter'}->get_error,'debug/twitter_api_error');
   }
 
-  $kernel->post('logger','log',$msg.' ('.$heap->{'twitter'}->http_code .') from Twitter API.',$heap->{'username'});  
+  $kernel->post('logger','log',$msg.' ('.$heap->{'twitter'}->http_code .' from Twitter API).',$heap->{'username'});  
 
   if ($heap->{'twitter'}->http_code == 400) {
     $msg .= ' Twitter API limit reached.';
@@ -162,6 +174,17 @@ sub tircd_getfriend {
   return 0;
 }
 
+sub tircd_getfollower {
+  my ($heap, $target) = @_[HEAP, ARG0];
+  
+  foreach my $follower (@{$heap->{'followers'}}) {
+    if ($follower->{'screen_name'} eq $target) {
+      return $follower;
+    }
+  }
+  return 0;
+}
+
 sub tircd_remfriend {
   my ($heap, $target) = @_[HEAP, ARG0];
   
@@ -191,7 +214,7 @@ sub tircd_login {
     return;
   }
 
-  $kernel->post('logger','log','Successfully authenicated with Twitter.',$heap->{'username'});
+  $kernel->post('logger','log','Successfully authenticated with Twitter.',$heap->{'username'});
 
   #stash the twitter object for use in the session  
   $heap->{'twitter'} = $twitter;
@@ -206,8 +229,20 @@ sub tircd_login {
   $kernel->yield('MOTD');  
 }
 
+sub tircd_connect {
+  my ($kernel, $heap) = @_[KERNEL, HEAP];
+  $kernel->post('logger','log',$heap->{'remote_ip'}.' connected.');
+}
+
 sub tircd_cleanup {
-  $_[KERNEL]->yield('shutdown');
+  my ($kernel, $heap) = @_[KERNEL, HEAP];
+  $kernel->post('logger','log',$heap->{'remote_ip'}.' disconnected.',$heap->{'username'});
+
+  #remove our timers so the session will die
+  $kernel->delay('twitter_timeline');  
+  $kernel->delay('twitter_direct_messages');
+  
+  $kernel->yield('shutdown');
 }
 
 
@@ -216,12 +251,19 @@ sub tircd_cleanup {
 #trigger an event and move on, the ones we care about will get trapped
 sub irc_line {
   my  ($kernel, $data) = @_[KERNEL, ARG0];
+  if ($config{'debug'}) {
+    $kernel->post('logger','log',$data->{'prefix'}.' '.$data->{'command'}.' '.join(' ',@{$data->{'params'}}),'debug/irc_line');
+  }
   $kernel->yield($data->{'command'},$data); 
 }
 
 #send a message that looks like it came from a user
 sub irc_user_msg {
-  my ($heap, $code, $username, @params) = @_[HEAP, ARG0, ARG1, ARG2..$#_];
+  my ($kernel, $heap, $code, $username, @params) = @_[KERNEL, HEAP, ARG0, ARG1, ARG2..$#_];
+
+  if ($config{'debug'}) {
+    $kernel->post('logger','log',$username.' '.$code.' '.join(' ',@params),'debug/irc_user_msg');
+  }
 
   $heap->{'client'}->put({
     command => $code,
@@ -232,10 +274,14 @@ sub irc_user_msg {
 
 #send a message that comes from the server
 sub irc_reply {
-  my ($heap, $code, @params) = @_[HEAP, ARG0, ARG1..$#_];
-  
+  my ($kernel, $heap, $code, @params) = @_[KERNEL, HEAP, ARG0, ARG1..$#_];
+
   if ($code ne 'PONG') {
     unshift(@params,$heap->{'username'}); #prepend the target username to the message;
+  }
+
+  if ($config{'debug'}) {
+    $kernel->post('logger','log',':tircd '.$code.' '.join(' ',@params),'debug/irc_reply');
   }
 
   $heap->{'client'}->put({
@@ -308,20 +354,36 @@ sub irc_join {
   my @friends = ();
   my $page = 1;  
   while (my $f = $heap->{'twitter'}->friends({page => $page})) {
-  last if @$f == 0;    
+    last if @$f == 0;    
     push(@friends,@$f);
     $page++;
   }
 
   #if we have no data, there was an error, or the user is a loser with no friends, eject 'em
   if ($page == 1 && $heap->{'twitter'}->http_code >= 400) {
-    $kernel->yield('twitter_api_error','Unable to get friends list.');
+    $kernel->call($_[SESSION],'twitter_api_error','Unable to get friends list.');
     return;
   } 
 
-  #cache our friends  
+  #get list of friends
+  my @followers = ();
+  my $page = 1;  
+  while (my $f = $heap->{'twitter'}->followers({page => $page})) {
+    last if @$f == 0;    
+    push(@followers,@$f);
+    $page++;
+  }
+
+  #alert this error, but don't end 'em
+  if ($page == 1 && $heap->{'twitter'}->http_code >= 400) {
+    $kernel->call($_[SESSION],'twitter_api_error','Unable to get followers list.');
+  } 
+
+  #cache our friends and followers
   $heap->{'friends'} = \@friends;
-  $kernel->post('logger','log','Received friends list from Twitter, caching '.@{$heap->{'friends'}}.' friends',$heap->{'username'});
+  $heap->{'followers'} = \@followers;
+  $kernel->post('logger','log','Received friends list from Twitter, caching '.@{$heap->{'friends'}}.' friends.',$heap->{'username'});
+  $kernel->post('logger','log','Received followers list from Twitter, caching '.@{$heap->{'followers'}}.' followers.',$heap->{'username'});
 
   #spoof the channel join
   $kernel->yield('user_msg','JOIN',$heap->{'username'},$chan);	
@@ -334,7 +396,12 @@ sub irc_join {
     if ($user->{'screen_name'} eq $heap->{'username'}) {
       $lastmsg = $user->{'status'}->{'text'};
     }
-    push(@users,$user->{'screen_name'});
+    #give people who follows us back voice
+    if ($kernel->call($_[SESSION],'getfollower',$user->{'screen_name'})) {
+      push(@users,'+'.$user->{'screen_name'});
+    } else {
+      push(@users,$user->{'screen_name'});
+    }
   }
   
   if (!$lastmsg) { #if we aren't already in the list, add us to the list for NAMES - AND go grab one tweet to put us in the array
@@ -368,6 +435,7 @@ sub irc_part {
   if (exists $heap->{'channels'}{$chan}) {
     delete $heap->{'channels'}{$chan};
     delete $heap->{'friends'};
+    delete $heap->{'followers'};
     $kernel->yield('user_msg','PART',$heap->{'username'},$chan);
   } else {
     $kernel->yield('server_reply',442,$chan,"You're not on that channel");
@@ -399,7 +467,7 @@ sub irc_mode { #ignore all mode requests (send back the appropriate message to k
         $kernel->yield('user_msg','MODE',$heap->{'username'},$target,$mode,$opts);
       } else {
         if ($heap->{'twitter'}->http_code >= 400) {
-          $kernel->yield('twitter_api_error','Unable to block user.');
+          $kernel->call($_[SESSION],'twitter_api_error','Unable to block user.');
         } else {
           $kernel->yield('server_reply',401,$nick,'No such nick/channel');
         }
@@ -410,7 +478,7 @@ sub irc_mode { #ignore all mode requests (send back the appropriate message to k
         $kernel->yield('user_msg','MODE',$heap->{'username'},$target,$mode,$opts);
       } else {
         if ($heap->{'twitter'}->http_code >= 400) {
-          $kernel->yield('twitter_api_error','Unable to unblock user.');
+          $kernel->call($_[SESSION],'twitter_api_error','Unable to unblock user.');
         } else {
           $kernel->yield('server_reply',401,$nick,'No such nick/channel');
         }
@@ -429,12 +497,20 @@ sub irc_who {
   if ($target =~ /^\#/) {
     if ($target eq '#twitter') {
       foreach my $friend (@{$heap->{'friends'}}) {
-        $kernel->yield('server_reply',352,$target,$friend->{'screen_name'},'twitter','tircd',$friend->{'screen_name'},'G',"0 $friend->{'name'}");
+        my $ov = '';
+        if ($kernel->call($_[SESSION],'getfollower',$friend->{'screen_name'})) {
+          $ov='+';
+        }
+        $kernel->yield('server_reply',352,$target,$friend->{'screen_name'},'twitter','tircd',$friend->{'screen_name'},"G$ov","0 $friend->{'name'}");
       }
     }      
   } else { #only support a ghetto version of /who right now, /who ** and what not won't work
     if (my $friend = $kernel->call($_[SESSION],'getfriend',$target)) {
-        $kernel->yield('server_reply',352,'*',$friend->{'screen_name'},'twitter','tircd',$friend->{'screen_name'},'G',"0 $friend->{'name'}");
+        my $ov = '';
+        if ($kernel->call($_[SESSION],'getfollower',$friend->{'screen_name'})) {
+          $ov='+';
+        }
+        $kernel->yield('server_reply',352,'*',$friend->{'screen_name'},'twitter','tircd',$friend->{'screen_name'}, "G$ov","0 $friend->{'name'}");
     }
   }
   $kernel->yield('server_reply',315,$target,'End of /WHO list'); 
@@ -454,7 +530,7 @@ sub irc_whois {
   }
   
   if (!$friend && $heap->{'twitter'}->http_code >= 400) {
-    $kernel->yield('twitter_api_error','Unable to get user information.');
+    $kernel->call($_[SESSION],'twitter_api_error','Unable to get user information.');
   }        
 
   if ($friend) {
@@ -506,7 +582,11 @@ sub irc_whois {
     $kernel->yield('server_reply',317,$target,$diff,'seconds idle');
 
     if ($isfriend) {
-      $kernel->yield('server_reply',319,$target,'#twitter ');
+      my $ov = '';
+      if ($kernel->call($_[SESSION],'getfollower',$friend->{'screen_name'})) {
+        $ov='+';
+      }
+      $kernel->yield('server_reply',319,$target,"$ov#twitter ");
     }
   }
 
@@ -582,7 +662,7 @@ sub irc_invite {
     }
   } else {
     if ($heap->{'twitter'}->http_code >= 400) {
-      $kernel->yield('twitter_api_error','Unable to follow user.');    
+      $kernel->call($_[SESSION],'twitter_api_error','Unable to follow user.');    
     } else {
       $kernel->yield('server_reply',401,$target,'No such nick/channel');
       $kernel->post('logger','log',"Attempted to follow non-existant user $target",$heap->{'username'});      
@@ -614,7 +694,7 @@ sub irc_kick {
     $kernel->post('logger','log',"Stoped following $target",$heap->{'username'});
   } else {
     if ($heap->{'twitter'}->http_code >= 400) {
-      $kernel->yield('twitter_api_error','Unable to unfollow user.');    
+      $kernel->call($_[SESSION],'twitter_api_error','Unable to unfollow user.');    
     } else {
       $kernel->yield('server_reply',441,$target,'#twitter',"They aren't on that channel");  
       $kernel->post('logger','log',"Attempted to unfollow user ($target) we weren't following",$heap->{'username'});
@@ -654,12 +734,12 @@ sub twitter_timeline {
   if (!$timeline || @$timeline == 0) {
     $timeline = [];
     if ($heap->{'twitter'}->http_code >= 400) {
-      $kernel->yield('twitter_api_error','Unable to update timeline.');   
+      $kernel->call($_[SESSION],'twitter_api_error','Unable to update timeline.');   
     }
   } else {
     #if we got new data save our position
     $heap->{'timeline_since_id'} = @{$timeline}[0]->{'id'};
-    $kernel->post('logger','log','Received '.@$timeline.' timeline updates from Twitter',$heap->{'username'});
+    $kernel->post('logger','log','Received '.@$timeline.' timeline updates from Twitter.',$heap->{'username'});
   }
 
   #get updated @replies too
@@ -673,11 +753,11 @@ sub twitter_timeline {
   if (!$replies || @$replies == 0) {
     $replies = [];
     if ($heap->{'twitter'}->http_code >= 400) {
-      $kernel->yield('twitter_api_error','Unable to update @replies.');   
+      $kernel->call($_[SESSION],'twitter_api_error','Unable to update @replies.');   
     }
   } else {  
     $heap->{'replies_since_id'} = @{$replies}[0]->{'id'};
-    $kernel->post('logger','log','Received '.@$replies.' @replies from Twitter',$heap->{'username'});
+    $kernel->post('logger','log','Received '.@$replies.' @replies from Twitter.',$heap->{'username'});
   }
   
   #weave the two arrays together into one stream, removing duplicates
@@ -722,11 +802,11 @@ sub twitter_direct_messages {
   if (!$data || @$data == 0) {
     $data = [];
     if ($heap->{'twitter'}->http_code >= 400) {
-      $kernel->yield('twitter_api_error','Unable to update direct messages.');   
+      $kernel->call($_[SESSION],'twitter_api_error','Unable to update direct messages.');   
     }
   } else {
     $heap->{'direct_since_id'} = @{$data}[0]->{'id'};
-    $kernel->post('logger','log','Received '.@$data.' direct messages from Twitter',$heap->{'username'});
+    $kernel->post('logger','log','Received '.@$data.' direct messages from Twitter.',$heap->{'username'});
   }
 
   foreach my $item (sort {$a->{'id'} <=> $b->{'id'}} @{$data}) {
@@ -778,7 +858,7 @@ C<cpan -i POE POE::Filter::IRCD Net::Twitter Date::Manip>
 
 C<./tircd.pl [/path/to/tircd.cfg]>
 
-When started, tircd will look for a configuration file named tircd.cfg in the same directory as the program. A sample configuration file is include with the program.
+When started, tircd will look for a configuration file named tircd.cfg in the same directory as the program. A sample configuration file is included with the program.
 You can specify an alternate path to the configuration file on the commandline if you want to keep the configuration in another location.
 
 =item Connecting
