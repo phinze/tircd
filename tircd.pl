@@ -4,15 +4,19 @@
 
 use strict;
 use Net::Twitter;
-use Date::Manip;
+use Time::Local;
+use File::Glob ':glob';
 use IO::File;
-use POE qw(Component::Server::TCP Filter::Stackable Filter::IRCD);
+use POE qw(Component::Server::TCP Filter::Stackable Filter::Map Filter::IRCD);
+use Data::Dumper;
 
-my $VERSION = 0.4;
+my $VERSION = 0.5;
 
 #load and parse our own very simple config file
 #didn't want to introduce another module requirement to parse XML or a YAML file
-my $config_file = $ARGV[0] || 'tircd.cfg';
+my $config_file = $ARGV[0] ? $ARGV[0] :
+  -e 'tircd.cfg' ? 'tircd.cfg' : bsd_glob('~',GLOB_TILDE | GLOB_ERR).'/.tircd';
+
 open(C,$config_file) || die("$0: Unable to load config file ($config_file): $!\n");
 my %config = ();
 while (<C>) {
@@ -23,14 +27,16 @@ while (<C>) {
 }
 close(C);
 
-#setup the timezone for Date::Manip if on windows
-if ($^O eq 'MSWin32') {
-  $ENV{'TZ'} = $config{'timzone'};
-}
-
 #setup our filter to process the IRC messages, jacked from the Filter:IRCD docs
 my $filter = POE::Filter::Stackable->new();
 $filter->push( POE::Filter::Line->new( InputRegexp => '\015?\012', OutputLiteral => "\015\012" ));
+#twitter's json feed escapes < and >, let's fix that
+$filter->push( POE::Filter::Map->new(Code => sub {
+  local $_ = shift;
+  s/\&lt\;/\</;
+  s/\&gt\;/\>/;
+  return $_;
+}));
 if ($config{'debug'} > 1) {
   $filter->push(POE::Filter::IRCD->new(debug => 1));
 } else {
@@ -96,7 +102,8 @@ exit 0;
 ########## STARTUP FUNCTIONS BEGIN
 
 sub tircd_setup {
-  $_[KERNEL]->call('logger','log',"tircd $VERSION started, listening on: $config{'address'}:$config{'port'}."); 
+  $_[KERNEL]->call('logger','log',"tircd $VERSION started, using config from: $config_file.");
+  $_[KERNEL]->call('logger','log',"Listening on: $config{'address'}:$config{'port'}."); 
 }
 
 #setup our logging session
@@ -393,19 +400,18 @@ sub irc_join {
   #the the list of our users for /NAMES
   my @users; my $lastmsg = '';
   foreach my $user (@{$heap->{'friends'}}) {
+    my $ov ='';
     if ($user->{'screen_name'} eq $heap->{'username'}) {
       $lastmsg = $user->{'status'}->{'text'};
+      $ov = '@';
+    } elsif ($kernel->call($_[SESSION],'getfollower',$user->{'screen_name'})) {
+      $ov='+';
     }
-    #give people who follows us back voice
-    if ($kernel->call($_[SESSION],'getfollower',$user->{'screen_name'})) {
-      push(@users,'+'.$user->{'screen_name'});
-    } else {
-      push(@users,$user->{'screen_name'});
-    }
+    push(@users,$ov.$user->{'screen_name'});
   }
   
   if (!$lastmsg) { #if we aren't already in the list, add us to the list for NAMES - AND go grab one tweet to put us in the array
-    unshift(@users, $heap->{'username'});
+    unshift(@users, '@'.$heap->{'username'});
     my $data = eval { $heap->{'twitter'}->user_timeline({count => 1}) };
     if ($data && @$data > 0) {
       $kernel->post('logger','log','Received user timeline from Twitter.',$heap->{'username'});
@@ -498,7 +504,9 @@ sub irc_who {
     if ($target eq '#twitter') {
       foreach my $friend (@{$heap->{'friends'}}) {
         my $ov = '';
-        if ($kernel->call($_[SESSION],'getfollower',$friend->{'screen_name'})) {
+        if ($friend->{'screen_name'} eq $heap->{'username'}) {
+          $ov='@';
+        } elsif ($kernel->call($_[SESSION],'getfollower',$friend->{'screen_name'})) {
           $ov='+';
         }
         $kernel->yield('server_reply',352,$target,$friend->{'screen_name'},'twitter','tircd',$friend->{'screen_name'},"G$ov","0 $friend->{'name'}");
@@ -507,7 +515,9 @@ sub irc_who {
   } else { #only support a ghetto version of /who right now, /who ** and what not won't work
     if (my $friend = $kernel->call($_[SESSION],'getfriend',$target)) {
         my $ov = '';
-        if ($kernel->call($_[SESSION],'getfollower',$friend->{'screen_name'})) {
+        if ($target eq $heap->{'username'}) {
+          $ov='@';
+        } elsif ($kernel->call($_[SESSION],'getfollower',$friend->{'screen_name'})) {
           $ov='+';
         }
         $kernel->yield('server_reply',352,'*',$friend->{'screen_name'},'twitter','tircd',$friend->{'screen_name'}, "G$ov","0 $friend->{'name'}");
@@ -528,9 +538,15 @@ sub irc_whois {
     $friend = eval { $heap->{'twitter'}->show_user($target) };
     $isfriend = 0;
   }
-  
+
+  if ($heap->{'twitter'}->http_code == 404) {
+    $kernel->yield('server_reply',402,$target,'No such server');
+    return;
+  }
+
   if (!$friend && $heap->{'twitter'}->http_code >= 400) {
     $kernel->call($_[SESSION],'twitter_api_error','Unable to get user information.');
+    return;
   }        
 
   if ($friend) {
@@ -572,18 +588,19 @@ sub irc_whois {
     $kernel->yield('server_reply',312,$target,$server,$info);
     
     #set their idle time, to the time since last message (if we have one, the api won't return the most recent message for users who haven't updated in a long time)
-    my $diff;
-    if ($friend->{'status'}->{'created_at'}) {
-      my $date = UnixDate(ParseDate($friend->{'status'}->{'created_at'}),'%s');
-      $diff = time()-$date;
-    } else {
-      $diff = 0;
+    my $diff = 0;
+    my %mon2num = qw(Jan 0 Feb 1 Mar 2 Apr 3 May 4 Jun 5 Jul 6 Aug 7 Sep 8 Oct 9 Nov 10 Dec 11);
+    if ($friend->{'status'}->{'created_at'} =~ /\w+ (\w+) (\d+) (\d+):(\d+):(\d+) [+|-]\d+ (\d+)/) {
+        my $date = timegm($5,$4,$3,$2,$mon2num{$1},$6);
+        $diff = time()-$date;
     }
     $kernel->yield('server_reply',317,$target,$diff,'seconds idle');
 
     if ($isfriend) {
       my $ov = '';
-      if ($kernel->call($_[SESSION],'getfollower',$friend->{'screen_name'})) {
+      if ($friend->{'screen_name'} eq $heap->{'username'}) {
+        $ov='@';
+      } elsif ($kernel->call($_[SESSION],'getfollower',$friend->{'screen_name'})) {
         $ov='+';
       }
       $kernel->yield('server_reply',319,$target,"$ov#twitter ");
@@ -607,6 +624,11 @@ sub irc_privmsg {
 
     #in a channel, this an update
     my $update = eval { $heap->{'twitter'}->update($msg) };
+    if (!$update && $heap->{'twitter'}->http_code >= 400) {
+      $kernel->call($_[SESSION],'twitter_api_error','Unable to update status.');
+      return;
+    } 
+
     $msg = $update->{'text'};
     
     #update our own friend record
@@ -661,7 +683,7 @@ sub irc_invite {
       $kernel->post('logger','log',"Sent request to follow $target",$heap->{'username'});      
     }
   } else {
-    if ($heap->{'twitter'}->http_code >= 400) {
+    if ($heap->{'twitter'}->http_code >= 400 && $heap->{'twitter'}->http_code != 403) {
       $kernel->call($_[SESSION],'twitter_api_error','Unable to follow user.');    
     } else {
       $kernel->yield('server_reply',401,$target,'No such nick/channel');
@@ -844,11 +866,9 @@ L<POE::Filter::IRCD>
 
 L<Net::Twitter>
 
-L<Date::Manip>
-
 You can install them all by running:
 
-C<cpan -i POE POE::Filter::IRCD Net::Twitter Date::Manip>
+C<cpan -i POE POE::Filter::IRCD Net::Twitter>
 
 =head1 USAGE
 
@@ -858,7 +878,7 @@ C<cpan -i POE POE::Filter::IRCD Net::Twitter Date::Manip>
 
 C<./tircd.pl [/path/to/tircd.cfg]>
 
-When started, tircd will look for a configuration file named tircd.cfg in the same directory as the program. A sample configuration file is included with the program.
+When started, tircd will look for a configuration file named tircd.cfg (in the same directory as the program) or ~/.tircd. A sample configuration file is included with the program.
 You can specify an alternate path to the configuration file on the commandline if you want to keep the configuration in another location.
 
 =item Connecting
@@ -931,5 +951,3 @@ L<POE>
 L<POE::Filter::IRCD>
 
 L<Net::Twitter>
-
-L<Date::Manip>
