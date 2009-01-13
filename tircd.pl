@@ -88,6 +88,7 @@ POE::Component::Server::TCP->new(
     KICK => \&irc_kick,
     QUIT => \&irc_quit,
     PING => \&irc_ping,
+    AWAY => \&irc_away,
     
     server_reply => \&irc_reply,
     user_msg	 => \&irc_user_msg,
@@ -792,6 +793,16 @@ sub irc_ping {
   my $target = $data->{'params'}[0];
   
   $kernel->yield('server_reply','PONG',$target);
+}
+
+sub irc_away {
+  my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
+  
+  if ($data->{'params'}[0]) {
+    $kernel->yield('server_reply',306,'You have been marked as being away');
+  } else {
+    $kernel->yield('server_reply',305,'You are no longer marked as being away');  
+  }
 }
 
 #shutdown the socket when the user quits
