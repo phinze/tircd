@@ -3,14 +3,25 @@
 # perldoc this file for more information.
 
 use strict;
+use JSON::Any;
 use Net::Twitter;
 use Time::Local;
 use File::Glob ':glob';
 use IO::File;
+use LWP::UserAgent;
 use POE qw(Component::Server::TCP Filter::Stackable Filter::Map Filter::IRCD);
-use Data::Dumper;
 
 my $VERSION = 0.5;
+
+#Do some sanity checks on the environment and warn if not what we want
+if ($Net::Twitter::VERSION < 1.23) {
+  print "Warning: Your system has an old version of Net::Twitter.  Please upgrade to the current version.\n";
+}
+
+my $j = JSON::Any->new;
+if ($j->handlerType eq 'JSON::Syck') {
+  print "Warning: Your system is using JSON::Syck. This will cause problems with character encoding.   Please install JSON::PP or JSON::XS.\n";
+}
 
 #load and parse our own very simple config file
 #didn't want to introduce another module requirement to parse XML or a YAML file
@@ -27,7 +38,10 @@ while (<C>) {
 }
 close(C);
 
-#setup our filter to process the IRC messages, jacked from the Filter:IRCD docs
+#storage for connected users
+my %users;
+
+#setup our filter to process the IRC messages, jacked from the Filter::IRCD docs
 my $filter = POE::Filter::Stackable->new();
 $filter->push( POE::Filter::Line->new( InputRegexp => '\015?\012', OutputLiteral => "\015\012" ));
 #twitter's json feed escapes < and >, let's fix that
@@ -226,6 +240,9 @@ sub tircd_login {
   #stash the twitter object for use in the session  
   $heap->{'twitter'} = $twitter;
 
+  #stash the username in a list to keep 'em from rejoining
+  $users{$heap->{'username'}} = 1;
+
   #some clients need this shit
   $kernel->yield('server_reply','001',"Welcome to tircd $heap->{'username'}");
   $kernel->yield('server_reply','002',"Your host is tircd running version $VERSION");
@@ -244,6 +261,9 @@ sub tircd_connect {
 sub tircd_cleanup {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
   $kernel->post('logger','log',$heap->{'remote_ip'}.' disconnected.',$heap->{'username'});
+  
+  #delete the username
+  delete $users{$heap->{'username'}};
 
   #remove our timers so the session will die
   $kernel->delay('twitter_timeline');  
@@ -268,6 +288,10 @@ sub irc_line {
 sub irc_user_msg {
   my ($kernel, $heap, $code, $username, @params) = @_[KERNEL, HEAP, ARG0, ARG1, ARG2..$#_];
 
+  foreach my $p (@params) { #fix multiline tweets, submitted a patch to Filter::IRCD to fix this in the long term
+    $p =~ s/\n/ /g;
+  }
+
   if ($config{'debug'}) {
     $kernel->post('logger','log',$username.' '.$code.' '.join(' ',@params),'debug/irc_user_msg');
   }
@@ -283,7 +307,11 @@ sub irc_user_msg {
 sub irc_reply {
   my ($kernel, $heap, $code, @params) = @_[KERNEL, HEAP, ARG0, ARG1..$#_];
 
-  if ($code ne 'PONG') {
+  foreach my $p (@params) {
+    $p =~ s/\n/ /g;
+  }
+
+  if ($code ne 'PONG' && $code != 436) {
     unshift(@params,$heap->{'username'}); #prepend the target username to the message;
   }
 
@@ -311,6 +339,13 @@ sub irc_nick {
     $kernel->yield('server_reply',433,'Changing nicks once connected is not currently supported.');    
     return;
   }
+
+  if (exists $users{$data->{'params'}[0]}) {
+    $kernel->yield('server_reply',436,$data->{'params'}[0],'You are already connected to Twitter with this username.');    
+    $kernel->yield('shutdown');
+    return;
+  }
+
   $heap->{'username'} = $data->{'params'}[0]; #stash the username for later
 
   if ($heap->{'username'} && $heap->{'password'} && !$heap->{'twitter'}) {
@@ -333,14 +368,20 @@ sub irc_motd {
 
   $kernel->yield('server_reply',375,'- tircd Message of the Day -');
 
-  $kernel->yield('server_reply',372,"- This code is uber alpha, if you got this far, consider your self lucky");
-  $kernel->yield('server_reply',372,"- ");
-  $kernel->yield('server_reply',372,"- /join #twitter to get started!");  
-  $kernel->yield('server_reply',372,"- ");  
-  $kernel->yield('server_reply',372,"- Please submit bug reports here: http://code.google.com/p/tircd/issues/list");  
-  $kernel->yield('server_reply',372,"- ");    
-  $kernel->yield('server_reply',372,'- @cnelson <cnelson@crazybrain.org>');    
-
+  my $ua = LWP::UserAgent->new;
+  $ua->timeout(5);
+  $ua->env_proxy();
+  my $res = $ua->get('http://tircd.googlecode.com/svn/trunk/motd.txt');
+  
+  if (!$res->is_success) {
+    $kernel->yield('server_reply',372,"- Unable to get the MOTD.");
+  } else {
+    my @lines = split(/\n/,$res->content);
+    foreach my $line (@lines) {
+      $kernel->yield('server_reply',372,"- $line");
+    }
+  }
+  
   $kernel->yield('server_reply',376,'End of /MOTD command.');
 }
 
@@ -430,8 +471,8 @@ sub irc_join {
   $kernel->yield('user_msg','TOPIC',$heap->{'username'},$chan,"$heap->{'username'}'s last update: $lastmsg");
 
   #start our twitter even loop, grab the timeline, replies and direct messages
-  $kernel->yield('twitter_timeline'); 
-  $kernel->yield('twitter_direct_messages'); 
+  $kernel->yield('twitter_timeline',$config{'join_silent'}); 
+  $kernel->yield('twitter_direct_messages',$config{'join_silent'}); 
 }
 
 sub irc_part {
@@ -612,9 +653,30 @@ sub irc_whois {
 
 sub irc_privmsg {
   my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
-
+  
   my $target = $data->{'params'}[0];
   my $msg  = $data->{'params'}[1];
+  
+  if ($config{'long_messages'} eq 'warn' && length($msg) > 140) {
+      $kernel->yield('server_reply',404,$target,'Your message is '.length($msg).' characters long.  Your message was not sent.');
+      return;
+  }  
+
+  if ($config{'long_messages'} eq 'split' && length($msg) > 140) {
+    my @parts = $msg =~ /(.{1,140})/g;
+    if (length($parts[$#parts]) < $config{'min_length'}) {
+      $kernel->yield('server_reply',404,$target,"The last message would only be ".length($parts[$#parts]).' characters long.  Your message was not sent.');
+      return;
+    }
+    
+    #if we got this far, recue the split messages
+    foreach my $part (@parts) {
+      $data->{'params'}[1] = $part;
+      $kernel->call($_[SESSION],'PRIVMSG',$data);
+    }
+
+    return;
+  }
 
   if ($target =~ /^#/) {
     if (!exists $heap->{'channels'}->{$target}) {
@@ -742,7 +804,7 @@ sub irc_quit {
 ########### TWITTER EVENT/ALARM FUNCTIONS
 
 sub twitter_timeline {
-  my ($kernel, $heap) = @_[KERNEL, HEAP];
+  my ($kernel, $heap, $silent) = @_[KERNEL, HEAP, ARG0];
 
   #get updated messages
   my $timeline;
@@ -801,9 +863,11 @@ sub twitter_timeline {
       $kernel->yield('user_msg','JOIN',$item->{'user'}->{'screen_name'},'#twitter');
     }
     
-    #filter out our own messages
+    #filter out our own messages / don't display if not in silent mode
     if ($item->{'user'}->{'screen_name'} ne $heap->{'username'}) {
-      $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},'#twitter',$item->{'text'});
+      if (!$silent) {
+        $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},'#twitter',$item->{'text'});
+      }        
     }
   }
 
@@ -812,7 +876,7 @@ sub twitter_timeline {
 
 #same as above, but for direct messages, show 'em as PRIVMSGs from the user
 sub twitter_direct_messages {
-  my ($kernel, $heap) = @_[KERNEL, HEAP];
+  my ($kernel, $heap, $silent) = @_[KERNEL, HEAP, ARG0];
 
   my $data;
   if ($heap->{'direct_since_id'}) {
@@ -840,7 +904,9 @@ sub twitter_direct_messages {
       $kernel->yield('user_msg','JOIN',$item->{'sender'}->{'screen_name'},'#twitter');
     }
     
-    $kernel->yield('user_msg','PRIVMSG',$item->{'sender'}->{'screen_name'},$heap->{'username'},$item->{'text'});
+    if (!$silent) {
+      $kernel->yield('user_msg','PRIVMSG',$item->{'sender'}->{'screen_name'},$heap->{'username'},$item->{'text'});
+    }      
   }
 
   $kernel->delay('twitter_direct_messages',$config{'update_directs'});
@@ -903,7 +969,8 @@ When users you follow update their status, it will be sent to the channel as a m
 
 =item Listing the users you follow
 
-Each user you follow will be in the #twitter channel.  If you follow a new user outside of tircd, that user will join the channel the first time they update their status.
+Each user you follow will be in the #twitter channel.  If you follow a new user outside of tircd, that user will join the channel the first time they update their status.  People who follow you back are given voice (+v) to indicate that fact.
+
 
 =item Direct Messages
 
