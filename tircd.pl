@@ -668,7 +668,7 @@ sub irc_invite {
       $kernel->yield('server_reply',341,$target,$chan);
       $kernel->yield('user_msg','JOIN',$target,$chan);
       if ($heap->{'channels'}->{$chan}->{'names'}->{$target} ne '') {
-        $kernel->yield('user_msg','MODE',$heap->{'username'},$target,'+v');
+        $kernel->yield('server_reply','MODE',$chan,'+v',$target);
       }
     } else {
       $kernel->yield('server_reply',481,"You must invite the user to the #twitter channel first.");    
@@ -687,7 +687,7 @@ sub irc_invite {
       $kernel->post('logger','log',"Started following $target",$heap->{'username'});
       if ($kernel->call($_[SESSION],'getfollower',$user->{'screen_name'})) {
         $heap->{'channels'}->{$chan}->{'names'}->{$target} = '+';
-        $kernel->yield('server_reply','MODE',$target,'+v');
+        $kernel->yield('server_reply','MODE',$chan,'+v',$target);        
       } else {
         $heap->{'channels'}->{$chan}->{'names'}->{$target} = '';
       }
@@ -923,7 +923,7 @@ sub twitter_timeline {
       $kernel->yield('user_msg','JOIN',$item->{'user'}->{'screen_name'},'#twitter');
       if ($kernel->call($_[SESSION],'getfollower',$item->{'user'}->{'screen_name'})) {
         $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '+';
-        $kernel->yield('server_reply','MODE',$item->{'user'}->{'screen_name'},'+v');
+        $kernel->yield('server_reply','MODE','#twiter','+v',$item->{'user'}->{'screen_name'});
       } else {
         $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '';
       }
@@ -974,7 +974,7 @@ sub twitter_direct_messages {
       $kernel->yield('user_msg','JOIN',$item->{'sender'}->{'screen_name'},'#twitter');
       if ($kernel->call($_[SESSION],'getfollower',$item->{'user'}->{'screen_name'})) {
         $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '+';
-        $kernel->yield('server_reply','MODE',$item->{'user'}->{'screen_name'},'+v');
+        $kernel->yield('server_reply','MODE','#twiter','+v',$item->{'user'}->{'screen_name'});        
       } else {
         $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '';
       }
