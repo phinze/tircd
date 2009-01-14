@@ -89,6 +89,8 @@ POE::Component::Server::TCP->new(
     QUIT => \&irc_quit,
     PING => \&irc_ping,
     AWAY => \&irc_away,
+
+    '#twitter' => \&channel_twitter,
     
     server_reply => \&irc_reply,
     user_msg	 => \&irc_user_msg,
@@ -312,7 +314,7 @@ sub irc_reply {
     $p =~ s/\n/ /g;
   }
 
-  if ($code ne 'PONG' && $code != 436) {
+  if ($code ne 'PONG' && $code ne 'MODE' && $code != 436) {
     unshift(@params,$heap->{'username'}); #prepend the target username to the message;
   }
 
@@ -390,108 +392,46 @@ sub irc_motd {
 sub irc_join {
   my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
 
-  my $chan = $data->{'params'}[0];
-
-  if ($chan ne '#twitter') { #only support the twitter channel right now
-    $kernel->yield('server_reply',403,$chan,'No such channel');
-    return;
-  }
-
-  #keep track of the channels they are in, kinda silly right now, but if we add multiple channel support in the future, it'll be good to have  
-  $heap->{'channels'}{$chan} = 1;
-
-  #get list of friends
-  my @friends = ();
-  my $page = 1;  
-  while (my $f = eval { $heap->{'twitter'}->friends({page => $page}) }) {
-    last if @$f == 0;    
-    push(@friends,@$f);
-    $page++;
-  }
-
-  #if we have no data, there was an error, or the user is a loser with no friends, eject 'em
-  if ($page == 1 && $heap->{'twitter'}->http_code >= 400) {
-    $kernel->call($_[SESSION],'twitter_api_error','Unable to get friends list.');
-    return;
-  } 
-
-  #get list of friends
-  my @followers = ();
-  my $page = 1;  
-  while (my $f = eval { $heap->{'twitter'}->followers({page => $page}) }) {
-    last if @$f == 0;    
-    push(@followers,@$f);
-    $page++;
-  }
-
-  #alert this error, but don't end 'em
-  if ($page == 1 && $heap->{'twitter'}->http_code >= 400) {
-    $kernel->call($_[SESSION],'twitter_api_error','Unable to get followers list.');
-  } 
-
-  #cache our friends and followers
-  $heap->{'friends'} = \@friends;
-  $heap->{'followers'} = \@followers;
-  $kernel->post('logger','log','Received friends list from Twitter, caching '.@{$heap->{'friends'}}.' friends.',$heap->{'username'});
-  $kernel->post('logger','log','Received followers list from Twitter, caching '.@{$heap->{'followers'}}.' followers.',$heap->{'username'});
-
-  #spoof the channel join
-  $kernel->yield('user_msg','JOIN',$heap->{'username'},$chan);	
-  $kernel->yield('server_reply',332,$chan,"$heap->{'username'}'s twiter");
-  $kernel->yield('server_reply',333,$chan,'tircd!tircd@tircd',time());
-  
-  #the the list of our users for /NAMES
-  my @users; my $lastmsg = '';
-  foreach my $user (@{$heap->{'friends'}}) {
-    my $ov ='';
-    if ($user->{'screen_name'} eq $heap->{'username'}) {
-      $lastmsg = $user->{'status'}->{'text'};
-      $ov = '@';
-    } elsif ($kernel->call($_[SESSION],'getfollower',$user->{'screen_name'})) {
-      $ov='+';
+  my @chans = split(/\,/,$data->{'params'}[0]);
+  foreach my $chan (@chans) {
+    $chan =~ s/\s//g;
+    #see if we've registered an event handler for a 'special channel' (currently only #twitter)
+    if ($kernel->call($_[SESSION],$chan,$chan)) {
+      next;
     }
-    push(@users,$ov.$user->{'screen_name'});
-  }
-  
-  if (!$lastmsg) { #if we aren't already in the list, add us to the list for NAMES - AND go grab one tweet to put us in the array
-    unshift(@users, '@'.$heap->{'username'});
-    my $data = eval { $heap->{'twitter'}->user_timeline({count => 1}) };
-    if ($data && @$data > 0) {
-      $kernel->post('logger','log','Received user timeline from Twitter.',$heap->{'username'});
-      my $tmp = $$data[0]->{'user'};
-      $tmp->{'status'} = $$data[0];
-      $lastmsg = $tmp->{'status'}->{'text'};
-      push(@{$heap->{'friends'}},$tmp);
+    
+    $heap->{'channels'}->{$chan} = {};
+    
+    #otherwise, prep a blank channel  
+    $kernel->yield('user_msg','JOIN',$heap->{'username'},$chan);	
+    $kernel->yield('server_reply',332,$chan,"$chan");
+    $kernel->yield('server_reply',333,$chan,'tircd!tircd@tircd',time());
+
+    $heap->{'channels'}->{$chan}->{'names'}->{$heap->{'username'}} = '@';  
+
+    #send the /NAMES info
+    my $all_users = '';
+    foreach my $name (keys %{$heap->{'channels'}->{$chan}->{'names'}}) {
+      $all_users .= $heap->{'channels'}->{$chan}->{'names'}->{$name} . $name .' ';
     }
-  }  
-
-  #send the /NAMES info
-  my $all_users = join(' ',@users);
-  $kernel->yield('server_reply',353,'=',$chan,$all_users);
-  $kernel->yield('server_reply',366,$chan,'End of /NAMES list');
-
-  $kernel->yield('user_msg','TOPIC',$heap->{'username'},$chan,"$heap->{'username'}'s last update: $lastmsg");
-
-  #start our twitter even loop, grab the timeline, replies and direct messages
-  $kernel->yield('twitter_timeline',$config{'join_silent'}); 
-  $kernel->yield('twitter_direct_messages',$config{'join_silent'}); 
+    $kernel->yield('server_reply',353,'=',$chan,$all_users);
+    $kernel->yield('server_reply',366,$chan,'End of /NAMES list');
+  }
 }
 
 sub irc_part {
   my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
   my $chan = $data->{'params'}[0];
   
-  if (exists $heap->{'channels'}{$chan}) {
-    delete $heap->{'channels'}{$chan};
-    delete $heap->{'friends'};
-    delete $heap->{'followers'};
+  if (exists $heap->{'channels'}->{$chan}) {
+    delete $heap->{'channels'}->{$chan};
     $kernel->yield('user_msg','PART',$heap->{'username'},$chan);
   } else {
     $kernel->yield('server_reply',442,$chan,"You're not on that channel");
   }
 }
 
-sub irc_mode { #ignore all mode requests (send back the appropriate message to keep the client happy)
+sub irc_mode { #ignore all mode requests except ban which is a block (send back the appropriate message to keep the client happy)
   my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
   my $target = $data->{'params'}[0];
   my $mode = $data->{'params'}[1];
@@ -544,26 +484,16 @@ sub irc_who {
   my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
   my $target = $data->{'params'}[0];
   if ($target =~ /^\#/) {
-    if ($target eq '#twitter') {
-      foreach my $friend (@{$heap->{'friends'}}) {
-        my $ov = '';
-        if ($friend->{'screen_name'} eq $heap->{'username'}) {
-          $ov='@';
-        } elsif ($kernel->call($_[SESSION],'getfollower',$friend->{'screen_name'})) {
-          $ov='+';
+    if (exists $heap->{'channels'}->{$target}) {
+      foreach my $name (keys %{$heap->{'channels'}->{$target}->{'names'}}) {
+        if (my $friend = $kernel->call($_[SESSION],'getfriend',$name)) {
+          $kernel->yield('server_reply',352,$target,$name,'twitter','tircd',$name,'G'.$heap->{'channels'}->{$target}->{'names'}->{$name},"0 $friend->{'name'}");
         }
-        $kernel->yield('server_reply',352,$target,$friend->{'screen_name'},'twitter','tircd',$friend->{'screen_name'},"G$ov","0 $friend->{'name'}");
-      }
-    }      
+      }      
+    }
   } else { #only support a ghetto version of /who right now, /who ** and what not won't work
     if (my $friend = $kernel->call($_[SESSION],'getfriend',$target)) {
-        my $ov = '';
-        if ($target eq $heap->{'username'}) {
-          $ov='@';
-        } elsif ($kernel->call($_[SESSION],'getfollower',$friend->{'screen_name'})) {
-          $ov='+';
-        }
-        $kernel->yield('server_reply',352,'*',$friend->{'screen_name'},'twitter','tircd',$friend->{'screen_name'}, "G$ov","0 $friend->{'name'}");
+        $kernel->yield('server_reply',352,'*',$friend->{'screen_name'},'twitter','tircd',$friend->{'screen_name'}, "G","0 $friend->{'name'}");
     }
   }
   $kernel->yield('server_reply',315,$target,'End of /WHO list'); 
@@ -639,15 +569,13 @@ sub irc_whois {
     }
     $kernel->yield('server_reply',317,$target,$diff,'seconds idle');
 
-    if ($isfriend) {
-      my $ov = '';
-      if ($friend->{'screen_name'} eq $heap->{'username'}) {
-        $ov='@';
-      } elsif ($kernel->call($_[SESSION],'getfollower',$friend->{'screen_name'})) {
-        $ov='+';
+    my $all_chans;
+    foreach my $chan (keys %{$heap->{'channels'}}) {
+      if (exists $heap->{'channels'}->{$chan}->{'names'}->{$friend->{'screen_name'}}) {
+        $all_chans .= $heap->{'channels'}->{$chan}->{'names'}->{$friend->{'screen_name'}}."$chan ";
       }
-      $kernel->yield('server_reply',319,$target,"$ov#twitter ");
     }
+    $kernel->yield('server_reply',319,$target,$all_chans);
   }
 
   $kernel->yield('server_reply',318,$target,'End of /WHOIS list'); 
@@ -684,6 +612,8 @@ sub irc_privmsg {
     if (!exists $heap->{'channels'}->{$target}) {
       $kernel->yield('server_reply',404,$target,'Cannot send to channel');
       return;
+    } else {
+      $target = '#twitter'; #we want to force all topic changes and what not into twitter for now
     }
 
     #in a channel, this an update
@@ -727,11 +657,26 @@ sub irc_invite {
     return;
   }
 
-  if ($kernel->call($_[SESSION],'getfriend',$target)) {
+  if (exists $heap->{'channels'}->{$chan}->{'names'}->{$target}) {
     $kernel->yield('server_reply',443,$target,$chan,'is already on channel');
     return;
   }
 
+  if ($chan ne '#twitter') { #if it's not our main channel, just fake the user in, if we already follow them
+    if (exists $heap->{'channels'}->{'#twitter'}->{'names'}->{$target}) {
+      $heap->{'channels'}->{$chan}->{'names'}->{$target} = $heap->{'channels'}->{'#twitter'}->{'names'}->{$target};
+      $kernel->yield('server_reply',341,$target,$chan);
+      $kernel->yield('user_msg','JOIN',$target,$chan);
+      if ($heap->{'channels'}->{$chan}->{'names'}->{$target} ne '') {
+        $kernel->yield('user_msg','MODE',$heap->{'username'},$target,'+v');
+      }
+    } else {
+      $kernel->yield('server_reply',481,"You must invite the user to the #twitter channel first.");    
+    }
+    return;      
+  }
+
+  #if it's the main channel, we'll start following them on twitter
   my $user = eval { $heap->{'twitter'}->create_friend({id => $target}) };
   if ($user) {
     if (!$user->{'protected'}) {
@@ -740,6 +685,12 @@ sub irc_invite {
       $kernel->yield('server_reply',341,$user->{'screen_name'},$chan);
       $kernel->yield('user_msg','JOIN',$user->{'screen_name'},$chan);
       $kernel->post('logger','log',"Started following $target",$heap->{'username'});
+      if ($kernel->call($_[SESSION],'getfollower',$user->{'screen_name'})) {
+        $heap->{'channels'}->{$chan}->{'names'}->{$target} = '+';
+        $kernel->yield('server_reply','MODE',$target,'+v');
+      } else {
+        $heap->{'channels'}->{$chan}->{'names'}->{$target} = '';
+      }
     } else {
       #show a note if they are protected and we are waiting 
       #this should technically be a 482, but some clients were exiting the channel for some reason
@@ -768,21 +719,28 @@ sub irc_kick {
     return;
   }
   
-  if (!$kernel->call($_[SESSION],'getfriend',$target)) {
+  if (!$heap->{'channels'}->{$chan}->{'names'}->{$target}) {
     $kernel->yield('server_reply',441,$target,$chan,"They aren't on that channel");
     return;
   }
-
+  
+  if ($chan ne '#twitter') {
+    delete $heap->{'channels'}->{$chan}->{'names'}->{$target};
+    $kernel->yield('user_msg','KICK',$heap->{'username'},$chan,$target,$target);
+    return;
+  }
+  
   my $result = eval { $heap->{'twitter'}->destroy_friend($target) };
   if ($result) {
     $kernel->call($_[SESSION],'remfriend',$target);
+    delete $heap->{'channels'}->{$chan}->{'names'}->{$target};
     $kernel->yield('user_msg','KICK',$heap->{'username'},$chan,$target,$target);
     $kernel->post('logger','log',"Stoped following $target",$heap->{'username'});
   } else {
     if ($heap->{'twitter'}->http_code >= 400) {
       $kernel->call($_[SESSION],'twitter_api_error','Unable to unfollow user.');    
     } else {
-      $kernel->yield('server_reply',441,$target,'#twitter',"They aren't on that channel");  
+      $kernel->yield('server_reply',441,$target,$chan,"They aren't on that channel");  
       $kernel->post('logger','log',"Attempted to unfollow user ($target) we weren't following",$heap->{'username'});
     }
   }  
@@ -812,6 +770,96 @@ sub irc_quit {
   $kernel->yield('shutdown');
 }
 
+########### IRC 'SPECIAL CHANNELS'
+
+sub channel_twitter {
+  my ($kernel,$heap,$chan) = @_[KERNEL, HEAP, ARG0];
+
+  #add our channel to the list  
+  $heap->{'channels'}->{$chan} = {};
+
+  #get list of friends
+  my @friends = ();
+  my $page = 1;  
+  while (my $f = eval { $heap->{'twitter'}->friends({page => $page}) }) {
+    last if @$f == 0;    
+    push(@friends,@$f);
+    $page++;
+  }
+
+  #if we have no data, there was an error, or the user is a loser with no friends, eject 'em
+  if ($page == 1 && $heap->{'twitter'}->http_code >= 400) {
+    $kernel->call($_[SESSION],'twitter_api_error','Unable to get friends list.');
+    return;
+  } 
+
+  #get list of friends
+  my @followers = ();
+  my $page = 1;  
+  while (my $f = eval { $heap->{'twitter'}->followers({page => $page}) }) {
+    last if @$f == 0;    
+    push(@followers,@$f);
+    $page++;
+  }
+
+  #alert this error, but don't end 'em
+  if ($page == 1 && $heap->{'twitter'}->http_code >= 400) {
+    $kernel->call($_[SESSION],'twitter_api_error','Unable to get followers list.');
+  } 
+
+  #cache our friends and followers
+  $heap->{'friends'} = \@friends;
+  $heap->{'followers'} = \@followers;
+  $kernel->post('logger','log','Received friends list from Twitter, caching '.@{$heap->{'friends'}}.' friends.',$heap->{'username'});
+  $kernel->post('logger','log','Received followers list from Twitter, caching '.@{$heap->{'followers'}}.' followers.',$heap->{'username'});
+
+  #spoof the channel join
+  $kernel->yield('user_msg','JOIN',$heap->{'username'},$chan);	
+  $kernel->yield('server_reply',332,$chan,"$heap->{'username'}'s twitter");
+  $kernel->yield('server_reply',333,$chan,'tircd!tircd@tircd',time());
+  
+  #the the list of our users for /NAMES
+  my $lastmsg = '';
+  foreach my $user (@{$heap->{'friends'}}) {
+    my $ov ='';
+    if ($user->{'screen_name'} eq $heap->{'username'}) {
+      $lastmsg = $user->{'status'}->{'text'};
+      $ov = '@';
+    } elsif ($kernel->call($_[SESSION],'getfollower',$user->{'screen_name'})) {
+      $ov='+';
+    }
+    #keep a copy of who is in this channel
+    $heap->{'channels'}->{$chan}->{'names'}->{$user->{'screen_name'}} = $ov;
+  }
+  
+  if (!$lastmsg) { #if we aren't already in the list, add us to the list for NAMES - AND go grab one tweet to put us in the array
+    $heap->{'channels'}->{$chan}->{'names'}->{$heap->{'username'}} = '@';
+    my $data = eval { $heap->{'twitter'}->user_timeline({count => 1}) };
+    if ($data && @$data > 0) {
+      $kernel->post('logger','log','Received user timeline from Twitter.',$heap->{'username'});
+      my $tmp = $$data[0]->{'user'};
+      $tmp->{'status'} = $$data[0];
+      $lastmsg = $tmp->{'status'}->{'text'};
+      push(@{$heap->{'friends'}},$tmp);
+    }
+  }  
+
+  #send the /NAMES info
+  my $all_users = '';
+  foreach my $name (keys %{$heap->{'channels'}->{$chan}->{'names'}}) {
+    $all_users .= $heap->{'channels'}->{$chan}->{'names'}->{$name} . $name .' ';
+  }
+  $kernel->yield('server_reply',353,'=',$chan,$all_users);
+  $kernel->yield('server_reply',366,$chan,'End of /NAMES list');
+
+  $kernel->yield('user_msg','TOPIC',$heap->{'username'},$chan,"$heap->{'username'}'s last update: $lastmsg");
+
+  #start our twitter even loop, grab the timeline, replies and direct messages
+  $kernel->yield('twitter_timeline',$config{'join_silent'}); 
+  $kernel->yield('twitter_direct_messages',$config{'join_silent'}); 
+  
+  return 1;
+}
 
 ########### TWITTER EVENT/ALARM FUNCTIONS
 
@@ -873,12 +921,22 @@ sub twitter_timeline {
     } else { #if it's a new user, add 'em to the cache / and join 'em
       push(@{$heap->{'friends'}},$tmp);
       $kernel->yield('user_msg','JOIN',$item->{'user'}->{'screen_name'},'#twitter');
+      if ($kernel->call($_[SESSION],'getfollower',$item->{'user'}->{'screen_name'})) {
+        $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '+';
+        $kernel->yield('server_reply','MODE',$item->{'user'}->{'screen_name'},'+v');
+      } else {
+        $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '';
+      }
     }
     
     #filter out our own messages / don't display if not in silent mode
     if ($item->{'user'}->{'screen_name'} ne $heap->{'username'}) {
       if (!$silent) {
-        $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},'#twitter',$item->{'text'});
+        foreach my $chan (keys %{$heap->{'channels'}}) {
+          if (exists $heap->{'channels'}->{$chan}->{'names'}->{$item->{'user'}->{'screen_name'}}) {
+            $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},$chan,$item->{'text'});
+          }
+        }          
       }        
     }
   }
@@ -914,6 +972,12 @@ sub twitter_direct_messages {
       $tmp->{'status'}->{'text'} = '(dm) '.$tmp->{'status'}->{'text'};
       push(@{$heap->{'friends'}},$tmp);
       $kernel->yield('user_msg','JOIN',$item->{'sender'}->{'screen_name'},'#twitter');
+      if ($kernel->call($_[SESSION],'getfollower',$item->{'user'}->{'screen_name'})) {
+        $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '+';
+        $kernel->yield('server_reply','MODE',$item->{'user'}->{'screen_name'},'+v');
+      } else {
+        $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '';
+      }
     }
     
     if (!$silent) {
