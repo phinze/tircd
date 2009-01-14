@@ -11,7 +11,7 @@ use IO::File;
 use LWP::UserAgent;
 use POE qw(Component::Server::TCP Filter::Stackable Filter::Map Filter::IRCD);
 
-my $VERSION = 0.5;
+my $VERSION = 0.6;
 
 #Do some sanity checks on the environment and warn if not what we want
 if ($Net::Twitter::VERSION < 1.23) {
@@ -153,7 +153,7 @@ sub logger_log {
   $heap->{'file'}->put("$stamp$from$msg");
 }
 
-#trap twitter ap errors
+#trap twitter api errors
 sub twitter_api_error {
   my ($kernel,$heap, $msg) = @_[KERNEL, HEAP, ARG0];
   
@@ -329,6 +329,7 @@ sub irc_reply {
 
 
 ########### IRC EVENT FUNCTIONS
+
 sub irc_pass {
   my ($heap, $data) = @_[HEAP, ARG0];
   $heap->{'password'} = $data->{'params'}[0]; #stash the password for later
