@@ -138,9 +138,8 @@ sub logger_setup {
   }
   
   if ($handle) {
-    $heap->{'file'} = POE::Wheel::ReadWrite->new(
-      Handle => $handle,
-    );
+    #Win32 seems to blow up when trying to set FIONBIO on STDOUT/ERR
+    $heap->{'file'} = ($^O eq 'MSWin32' && $type ne 'file') ? $handle : POE::Wheel::ReadWrite->new( Handle => $handle );
   }
 }
 
@@ -152,7 +151,11 @@ sub logger_log {
   
   $from = "[$from] " if defined $from;
   my $stamp = '['.localtime().'] ';
-  $heap->{'file'}->put("$stamp$from$msg");
+  if (ref $heap->{'file'} eq 'POE::Wheel::ReadWrite')  {
+    $heap->{'file'}->put("$stamp$from$msg");
+  } else {
+    $heap->{'file'}->print("$stamp$from$msg\n");
+  }
 }
 
 #trap twitter api errors
