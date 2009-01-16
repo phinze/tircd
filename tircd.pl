@@ -13,6 +13,7 @@ use File::Glob ':glob';
 use IO::File;
 use LWP::UserAgent;
 use POE qw(Component::Server::TCP Filter::Stackable Filter::Map Filter::IRCD);
+use Data::Dumper;
 
 my $VERSION = 0.6;
 
@@ -444,6 +445,7 @@ sub irc_part {
 }
 
 sub irc_mode { #ignore all mode requests except ban which is a block (send back the appropriate message to keep the client happy)
+#this whole thing is messy as hell, need to refactor this function
   my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
   my $target = $data->{'params'}[0];
   my $mode = $data->{'params'}[1];
@@ -462,34 +464,42 @@ sub irc_mode { #ignore all mode requests except ban which is a block (send back 
   if ($target =~ /^\#/) {
     if ($mode eq 'b') {
       $kernel->yield('server_reply',368,$target,'End of channel ban list');
-    } elsif ($mode eq '+b') {
-      my $user = eval { $heap->{'twitter'}->create_block($nick) };
-      if ($user) {
-        $kernel->yield('user_msg','MODE',$heap->{'username'},$target,$mode,$opts);
-      } else {
-        if ($heap->{'twitter'}->http_code >= 400) {
-          $kernel->call($_[SESSION],'twitter_api_error','Unable to block user.');
+      return;
+    }
+    if ($target eq '#twitter') {
+      if ($mode eq '+b' && $target eq '#twitter') {
+        my $user = eval { $heap->{'twitter'}->create_block($nick) };
+        if ($user) {
+          $kernel->yield('user_msg','MODE',$heap->{'username'},$target,$mode,$opts);
         } else {
-          $kernel->yield('server_reply',401,$nick,'No such nick/channel');
+          if ($heap->{'twitter'}->http_code >= 400) {
+            $kernel->call($_[SESSION],'twitter_api_error','Unable to block user.');
+          } else {
+            $kernel->yield('server_reply',401,$nick,'No such nick/channel');
+          }
         }
-      }        
-    } elsif ($mode eq '-b') {
-      my $user = eval { $heap->{'twitter'}->destroy_block($nick) };
-      if ($user) {
-        $kernel->yield('user_msg','MODE',$heap->{'username'},$target,$mode,$opts);
-      } else {
-        if ($heap->{'twitter'}->http_code >= 400) {
-          $kernel->call($_[SESSION],'twitter_api_error','Unable to unblock user.');
+        return;        
+      } elsif ($mode eq '-b' && $target eq '#twitter') {
+        my $user = eval { $heap->{'twitter'}->destroy_block($nick) };
+        if ($user) {
+          $kernel->yield('user_msg','MODE',$heap->{'username'},$target,$mode,$opts);
         } else {
-          $kernel->yield('server_reply',401,$nick,'No such nick/channel');
+          if ($heap->{'twitter'}->http_code >= 400) {
+            $kernel->call($_[SESSION],'twitter_api_error','Unable to unblock user.');
+          } else {
+            $kernel->yield('server_reply',401,$nick,'No such nick/channel');
+          }
         }
-      }        
-    } else {
+        return;
+      }
+    }
+    if (!$mode) {        
       $kernel->yield('server_reply',324,$target,"+t");
     }
-  } else {
-    $kernel->yield('user_msg','MODE',$heap->{'username'},$target,'+i');
+    return;
   }
+  
+  $kernel->yield('user_msg','MODE',$heap->{'username'},$target,'+i');
 }
 
 sub irc_who {
@@ -731,7 +741,7 @@ sub irc_kick {
     return;
   }
   
-  if (!$heap->{'channels'}->{$chan}->{'names'}->{$target}) {
+  if (!exists $heap->{'channels'}->{$chan}->{'names'}->{$target}) {
     $kernel->yield('server_reply',441,$target,$chan,"They aren't on that channel");
     return;
   }
