@@ -28,7 +28,14 @@ C<cpan -i POE POE::Filter::IRCD Net::Twitter>
 
 C<./tircd.pl [/path/to/tircd.cfg]>
 
-When started, tircd will look for a configuration file named tircd.cfg (in the same directory as the program) or ~/.tircd. A sample configuration file is included with the program.
+When started, tircd will look for a configuration file in the following places:
+
+F<tircd.cfg> (in the current directory)
+
+F<~/.tircd>
+
+F</etc/tircd.cfg>
+
 You can specify an alternate path to the configuration file on the commandline if you want to keep the configuration in another location.
 
 =item Connecting
