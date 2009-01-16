@@ -1,6 +1,9 @@
 #!/usr/bin/perl
 # tircd - An ircd proxy to the Twitter API
-# perldoc this file for more information.
+# Copyright (c) 2009 Chris Nelson <tircd@crazybrain.org>
+# tircd is free software; you can redistribute it and/or modify it under the terms of either:
+# a) the GNU General Public License as published by the Free Software Foundation
+# b) the "Artistic License"
 
 use strict;
 use JSON::Any;
@@ -25,8 +28,14 @@ if ($j->handlerType eq 'JSON::Syck') {
 
 #load and parse our own very simple config file
 #didn't want to introduce another module requirement to parse XML or a YAML file
-my $config_file = $ARGV[0] ? $ARGV[0] :
-  -e 'tircd.cfg' ? 'tircd.cfg' : bsd_glob('~',GLOB_TILDE | GLOB_ERR).'/.tircd';
+my $config_file = '/etc/tircd.cfg';
+if ($ARGV[0]) {
+  $config_file = $ARGV[0];
+} elsif (-e 'tircd.cfg') {
+  $config_file = 'tircd.cfg';
+} elsif (-e bsd_glob('~',GLOB_TILDE | GLOB_ERR).'/.tircd') {
+  $config_file = bsd_glob('~',GLOB_TILDE | GLOB_ERR).'/.tircd';
+}
 
 open(C,$config_file) || die("$0: Unable to load config file ($config_file): $!\n");
 my %config = ();
@@ -993,107 +1002,6 @@ sub twitter_direct_messages {
 
 __END__
 
-=head1 NAME
+=head1 Documentation moved
 
-tircd  - An ircd proxy to the twitter API
-
-=head1 DESCRIPTION
-
-tircd presents twitter as an irc channel.  You can connect to tircd with any irc client, and twitter as if you were on irc
-
-=head1 INSTALLATION
-
-tircd requires a recent version of perl, and the following modules:
-
-L<POE>
-
-L<POE::Filter::IRCD>
-
-L<Net::Twitter>
-
-You can install them all by running:
-
-C<cpan -i POE POE::Filter::IRCD Net::Twitter>
-
-=head1 USAGE
-
-=over
-
-=item Running tircd
-
-C<./tircd.pl [/path/to/tircd.cfg]>
-
-When started, tircd will look for a configuration file named tircd.cfg (in the same directory as the program) or ~/.tircd. A sample configuration file is included with the program.
-You can specify an alternate path to the configuration file on the commandline if you want to keep the configuration in another location.
-
-=item Connecting
-
-By default, tircd listens on localhost port 6667.
-
-When connecting to tircd, you must ensure that your NICK is set to your twitter username, and that you send PASS with your twitter password.
-
-With many irc clients you can do this by issuing the command /SERVER [hostname running tircd] 6667 <your twitter password> <your twitter username>.   Check your client's documentation for the appropirate syntax.
-
-Once connected JOIN #twitter to get started.  The channel #twitter is where you will perform most opertions
-
-=item Updating your status
-
-To update your status on twitter, simply send a message to the #twitter channel.  The server will keep your most recent update in the topic at all times.
-
-=item Getting your friend's status
-
-When users you follow update their status, it will be sent to the channel as a message from them.
-
-@replies are also sent to the channel as messages.
-
-=item Listing the users you follow
-
-Each user you follow will be in the #twitter channel.  If you follow a new user outside of tircd, that user will join the channel the first time they update their status.  People who follow you back are given voice (+v) to indicate that fact.
-
-
-=item Direct Messages
-
-Direct messages to you will show up as a private message from the user.
-
-To send a direct message, simply send a private message to the user you want to dm.
-
-=item Getting additional information on users
-
-You can /who or /whois a user to view their Location / Bio / Website. Their last status update (and time sent) will also be returned.
-
-Issuing a /whois on your own user name will also provide the number of API calls that have been used in the last hour.
-
-=item Following new users
-
-To begin following a new user, simply /invite them to #twitter.  The user will join the channel if the request to follow was successful.  If you attempt to invite a user who protects their updates, you will receive a notice that you have requested to follow them.  The user will join the channel if they accept your request and update their status.
-
-=item Unfollowing / removing users
-
-To stop following a user, /kick them from #twitter.
-
-=item Blocking users 
-
-To block a user /ban them.  
-There is currently no way to get a list of users you've currently blocked via the API, so listing the bans in #twitter will only return users you've blocked in the current session.
-
-=item Unblocking users
-
-To unblock a user /unban them.
-
-=back
-
-=head1 AUTHOR
-
-Chris Nelson <cnelson@crazybrain.org>
-
-=head1 LICENSE
-
-This module may be used, modified, and distributed under the same terms as Perl itself. Please see the license that came with your Perl distribution for details.
-
-=head1 SEE ALSO
-
-L<POE>
-
-L<POE::Filter::IRCD>
-
-L<Net::Twitter>
+Please see tircd.pod which should have been included with this script
