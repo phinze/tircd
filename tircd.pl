@@ -869,6 +869,8 @@ sub irc_topic {
   my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
   my $chan = $data->{'params'}[0];
   my $topic = $data->{'params'}[1];
+  
+  return if $chan eq '#twitter';
 
   if (!$heap->{'channels'}->{$chan}->{'joined'}) {
     $kernel->yield('server_reply',442,$chan,"You're not on that channel");
