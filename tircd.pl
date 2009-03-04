@@ -12,13 +12,13 @@ use Time::Local;
 use File::Glob ':glob';
 use IO::File;
 use LWP::UserAgent;
+use Storable;
 use POE qw(Component::Server::TCP Filter::Stackable Filter::Map Filter::IRCD);
-use Data::Dumper;
 
-my $VERSION = 0.6;
+my $VERSION = 0.7;
 
 #Do some sanity checks on the environment and warn if not what we want
-if ($Net::Twitter::VERSION < 1.23) {
+if ($Net::Twitter::VERSION < 2.10) {
   print "Warning: Your system has an old version of Net::Twitter.  Please upgrade to the current version.\n";
 }
 
@@ -47,6 +47,9 @@ while (<C>) {
   $config{$key} = $value;
 }
 close(C);
+
+#config file backwards compatibility
+$config{'timeline_count'} = 20 if !exists $config{'timeline_count'};
 
 #storage for connected users
 my %users;
@@ -94,11 +97,13 @@ POE::Component::Server::TCP->new(
     WHO  => \&irc_who,
     WHOIS => \&irc_whois,
     PRIVMSG => \&irc_privmsg,
+    STATS => \&irc_stats,
     INVITE => \&irc_invite,
     KICK => \&irc_kick,
     QUIT => \&irc_quit,
     PING => \&irc_ping,
     AWAY => \&irc_away,
+    TOPIC => \&irc_topic,
 
     '#twitter' => \&channel_twitter,
     
@@ -108,6 +113,7 @@ POE::Component::Server::TCP->new(
     twitter_api_error => \&twitter_api_error,    
     twitter_timeline => \&twitter_timeline,
     twitter_direct_messages => \&twitter_direct_messages,
+    twitter_search => \&twitter_search,
     
     login => \&tircd_login,
     getfriend => \&tircd_getfriend,
@@ -259,6 +265,25 @@ sub tircd_login {
   #stash the username in a list to keep 'em from rejoining
   $users{$heap->{'username'}} = 1;
 
+  #load our configs from disk if they exist
+  $heap->{'config'}   = eval {retrieve($config{'storage_path'} . '/' . $heap->{'username'} . '.config');};
+  $heap->{'channels'} = eval {retrieve($config{'storage_path'} . '/' . $heap->{'username'} . '.channels');};
+
+  if (!$heap->{'config'}) {
+    my %copy = %config;
+    $heap->{'config'} = \%copy;
+    #I need to find a better way to parse out the user/server config items, maybe I'll have to rename them all with server_ / user_ prefixes, but not ready to do that yet
+    delete $heap->{'config'}->{'address'};
+    delete $heap->{'config'}->{'port'};    
+    delete $heap->{'config'}->{'storage_path'};    
+    delete $heap->{'config'}->{'logtype'};    
+    delete $heap->{'config'}->{'logfile'};    
+    delete $heap->{'config'}->{'debug'};
+  }
+  if (!$heap->{'channels'}) {
+    $heap->{'channels'} = {};
+  }
+
   #some clients need this shit
   $kernel->yield('server_reply','001',"Welcome to tircd $heap->{'username'}");
   $kernel->yield('server_reply','002',"Your host is tircd running version $VERSION");
@@ -285,6 +310,17 @@ sub tircd_cleanup {
   $kernel->delay('twitter_timeline');  
   $kernel->delay('twitter_direct_messages');
   
+  #if defined, save our data for next time
+  if ($config{'storage_path'} && -d $config{'storage_path'} && -w $config{'storage_path'}) {
+    #mark all channels as not joined for the next reload
+    foreach my $chan (keys %{$heap->{'channels'}}) {
+        $heap->{'channels'}->{$chan}->{'joined'} = 0;
+    }
+    eval {store($heap->{'config'},$config{'storage_path'} . '/' . $heap->{'username'} . '.config');};
+    eval {store($heap->{'channels'},$config{'storage_path'} . '/' . $heap->{'username'} . '.channels');};
+  } else {
+    $kernel->post('logger','log','storage_path is not set or is not writable, not saving configuration.',$heap->{'username'});  
+  }
   $kernel->yield('shutdown');
 }
 
@@ -295,6 +331,9 @@ sub tircd_cleanup {
 sub irc_line {
   my  ($kernel, $data) = @_[KERNEL, ARG0];
   if ($config{'debug'}) {
+    if (!$data->{'params'}) {
+      $data->{'params'} = [];
+    }
     $kernel->post('logger','log',$data->{'prefix'}.' '.$data->{'command'}.' '.join(' ',@{$data->{'params'}}),'debug/irc_line');
   }
   $kernel->yield($data->{'command'},$data); 
@@ -413,14 +452,19 @@ sub irc_join {
       next;
     }
     
-    $heap->{'channels'}->{$chan} = {};
+    #we might have something saved already, if not prep a new channel
+    if (!exists $heap->{'channels'}->{$chan} ) {
+      $heap->{'channels'}->{$chan} = {};
+      $heap->{'channels'}->{$chan}->{'names'}->{$heap->{'username'}} = '@';  
+    }
+    
+    $heap->{'channels'}->{$chan}->{'joined'} = 1;
     
     #otherwise, prep a blank channel  
     $kernel->yield('user_msg','JOIN',$heap->{'username'},$chan);	
     $kernel->yield('server_reply',332,$chan,"$chan");
     $kernel->yield('server_reply',333,$chan,'tircd!tircd@tircd',time());
 
-    $heap->{'channels'}->{$chan}->{'names'}->{$heap->{'username'}} = '@';  
 
     #send the /NAMES info
     my $all_users = '';
@@ -429,6 +473,12 @@ sub irc_join {
     }
     $kernel->yield('server_reply',353,'=',$chan,$all_users);
     $kernel->yield('server_reply',366,$chan,'End of /NAMES list');
+    
+    #restart the searching
+    if ($heap->{'channels'}->{$chan}->{'topic'}) {
+      $kernel->yield('user_msg','TOPIC',$heap->{'username'},$chan,$heap->{'channels'}->{$chan}->{'topic'});
+      $kernel->yield('twitter_search',$chan);
+    }
   }
 }
 
@@ -436,7 +486,7 @@ sub irc_part {
   my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
   my $chan = $data->{'params'}[0];
   
-  if (exists $heap->{'channels'}->{$chan}) {
+  if ($heap->{'channels'}->{$chan}->{'joined'}) {
     delete $heap->{'channels'}->{$chan};
     $kernel->yield('user_msg','PART',$heap->{'username'},$chan);
   } else {
@@ -591,16 +641,40 @@ sub irc_whois {
     }
     $kernel->yield('server_reply',317,$target,$diff,'seconds idle');
 
-    my $all_chans;
+    my $all_chans = '';
     foreach my $chan (keys %{$heap->{'channels'}}) {
       if (exists $heap->{'channels'}->{$chan}->{'names'}->{$friend->{'screen_name'}}) {
         $all_chans .= $heap->{'channels'}->{$chan}->{'names'}->{$friend->{'screen_name'}}."$chan ";
       }
     }
-    $kernel->yield('server_reply',319,$target,$all_chans);
+    if ($all_chans ne '') {
+      $kernel->yield('server_reply',319,$target,$all_chans);
+    }
   }
 
   $kernel->yield('server_reply',318,$target,'End of /WHOIS list'); 
+}
+
+sub irc_stats {
+  my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
+  my $key = $data->{'params'}[0];
+  my $val = $data->{'params'}[1];  
+  
+  $key = '--' if (!$key || $key eq 'm');
+  if ($key eq '--') {
+    $kernel->yield('server_reply',212,$key,"Current config settings:");
+    foreach my $k (sort keys %{$heap->{'config'}}) {
+      $kernel->yield('server_reply',212,$key,"  $k: ".$heap->{'config'}->{$k});  
+    }
+    $kernel->yield('server_reply',212,$key,"Use '/stats <key> <value>' to change a setting.");
+    $kernel->yield('server_reply',212,$key,"Example: /stats join_silent 1");
+  } else {
+    if (exists $heap->{'config'}->{$key}) {
+      $heap->{'config'}->{$key} = $val;
+      $kernel->yield('server_reply',212,$key,"set to $val");
+    } 
+  }
+  $kernel->yield('server_reply',219,$key,'End of /STATS request');
 }
 
 sub irc_privmsg {
@@ -609,14 +683,19 @@ sub irc_privmsg {
   my $target = $data->{'params'}[0];
   my $msg  = $data->{'params'}[1];
   
-  if ($config{'long_messages'} eq 'warn' && length($msg) > 140) {
+  #handle /me or ACTION requests properly
+  #this begins the slipperly slope of manipulating user input
+  $msg =~ s/\001ACTION (.*)\001/\*$1\*/;
+  
+  
+  if ($heap->{'config'}->{'long_messages'} eq 'warn' && length($msg) > 140) {
       $kernel->yield('server_reply',404,$target,'Your message is '.length($msg).' characters long.  Your message was not sent.');
       return;
   }  
 
-  if ($config{'long_messages'} eq 'split' && length($msg) > 140) {
+  if ($heap->{'config'}->{'long_messages'} eq 'split' && length($msg) > 140) {
     my @parts = $msg =~ /(.{1,140})/g;
-    if (length($parts[$#parts]) < $config{'min_length'}) {
+    if (length($parts[$#parts]) < $heap->{'config'}->{'min_length'}) {
       $kernel->yield('server_reply',404,$target,"The last message would only be ".length($parts[$#parts]).' characters long.  Your message was not sent.');
       return;
     }
@@ -674,7 +753,7 @@ sub irc_invite {
   my $target = $data->{'params'}[0];
   my $chan = $data->{'params'}[1];
 
-  if (!exists $heap->{'channels'}->{$chan}) {
+  if (!$heap->{'channels'}->{$chan}->{'joined'}) {
     $kernel->yield('server_reply',442,$chan,"You're not on that channel");
     return;
   }
@@ -736,7 +815,7 @@ sub irc_kick {
   my $chan = $data->{'params'}[0];  
   my $target = $data->{'params'}[1];
 
-  if (!exists $heap->{'channels'}->{$chan}) {
+  if (!$heap->{'channels'}->{$chan}->{'joined'}) {
     $kernel->yield('server_reply',442,$chan,"You're not on that channel");
     return;
   }
@@ -786,6 +865,23 @@ sub irc_away {
   }
 }
 
+sub irc_topic {
+  my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
+  my $chan = $data->{'params'}[0];
+  my $topic = $data->{'params'}[1];
+
+  if (!$heap->{'channels'}->{$chan}->{'joined'}) {
+    $kernel->yield('server_reply',442,$chan,"You're not on that channel");
+    return;
+  }
+  
+  $heap->{'channels'}->{$chan}->{'topic'} = $topic;
+  $heap->{'channels'}->{$chan}->{'search_since_id'} = 0;
+
+  $kernel->yield('user_msg','TOPIC',$heap->{'username'},$chan,$topic);  
+  $kernel->yield('twitter_search',$chan);  
+}
+
 #shutdown the socket when the user quits
 sub irc_quit {
   my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
@@ -799,6 +895,7 @@ sub channel_twitter {
 
   #add our channel to the list  
   $heap->{'channels'}->{$chan} = {};
+  $heap->{'channels'}->{$chan}->{'joined'} = 1;
 
   #get list of friends
   my @friends = ();
@@ -877,8 +974,8 @@ sub channel_twitter {
   $kernel->yield('user_msg','TOPIC',$heap->{'username'},$chan,"$heap->{'username'}'s last update: $lastmsg");
 
   #start our twitter even loop, grab the timeline, replies and direct messages
-  $kernel->yield('twitter_timeline',$config{'join_silent'}); 
-  $kernel->yield('twitter_direct_messages',$config{'join_silent'}); 
+  $kernel->yield('twitter_timeline',$heap->{'config'}->{'join_silent'}); 
+  $kernel->yield('twitter_direct_messages',$heap->{'config'}->{'join_silent'}); 
   
   return 1;
 }
@@ -891,9 +988,9 @@ sub twitter_timeline {
   #get updated messages
   my $timeline;
   if ($heap->{'timeline_since_id'}) {
-    $timeline = eval { $heap->{'twitter'}->friends_timeline({since_id => $heap->{'timeline_since_id'}}) };
+    $timeline = eval { $heap->{'twitter'}->friends_timeline({count => $heap->{'config'}->{'timeline_count'}, since_id => $heap->{'timeline_since_id'}}) };
   } else {
-    $timeline = eval { $heap->{'twitter'}->friends_timeline() };
+    $timeline = eval { $heap->{'twitter'}->friends_timeline({count => $heap->{'config'}->{'timeline_count'}}) };
   }
 
   #sometimes the twitter API returns undef, so we gotta check here
@@ -942,20 +1039,22 @@ sub twitter_timeline {
       $kernel->call($_[SESSION],'updatefriend',$tmp);
     } else { #if it's a new user, add 'em to the cache / and join 'em
       push(@{$heap->{'friends'}},$tmp);
-      $kernel->yield('user_msg','JOIN',$item->{'user'}->{'screen_name'},'#twitter');
-      if ($kernel->call($_[SESSION],'getfollower',$item->{'user'}->{'screen_name'})) {
-        $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '+';
-        $kernel->yield('server_reply','MODE','#twiter','+v',$item->{'user'}->{'screen_name'});
-      } else {
-        $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '';
-      }
+      
+      #removed the fake join tempoarily while, I figure out the better way to handle this.  I think the best is to leave it like this and treat the channels as if they are -n
+      #$kernel->yield('user_msg','JOIN',$item->{'user'}->{'screen_name'},'#twitter');
+      #if ($kernel->call($_[SESSION],'getfollower',$item->{'user'}->{'screen_name'})) {
+      #  $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '+';
+      #  $kernel->yield('server_reply','MODE','#twitter','+v',$item->{'user'}->{'screen_name'});
+      #} else {
+      #  $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '';
+      #}
     }
     
     #filter out our own messages / don't display if not in silent mode
     if ($item->{'user'}->{'screen_name'} ne $heap->{'username'}) {
       if (!$silent) {
         foreach my $chan (keys %{$heap->{'channels'}}) {
-          if (exists $heap->{'channels'}->{$chan}->{'names'}->{$item->{'user'}->{'screen_name'}}) {
+          if ($chan eq '#twitter' || exists $heap->{'channels'}->{$chan}->{'names'}->{$item->{'user'}->{'screen_name'}}) {
             $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},$chan,$item->{'text'});
           }
         }          
@@ -963,7 +1062,7 @@ sub twitter_timeline {
     }
   }
 
-  $kernel->delay('twitter_timeline',$config{'update_timeline'});
+  $kernel->delay('twitter_timeline',$heap->{'config'}->{'update_timeline'});
 }
 
 #same as above, but for direct messages, show 'em as PRIVMSGs from the user
@@ -1000,6 +1099,7 @@ sub twitter_direct_messages {
       } else {
         $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '';
       }
+ 
     }
     
     if (!$silent) {
@@ -1007,7 +1107,41 @@ sub twitter_direct_messages {
     }      
   }
 
-  $kernel->delay('twitter_direct_messages',$config{'update_directs'});
+  $kernel->delay('twitter_direct_messages',$heap->{'config'}->{'update_directs'});
+}
+
+sub twitter_search {
+  my ($kernel, $heap, $chan) = @_[KERNEL, HEAP, ARG0];
+
+  if (!$heap->{'channels'}->{$chan}->{'joined'} || !$heap->{'channels'}->{$chan}->{'topic'}) {
+    #if we aren't in the channel, don't od anythning, this will keep us from restarting timers for channels we are no longer in
+    return;
+  }
+  
+  my $data;
+  if ($heap->{'channels'}->{$chan}->{'search_since_id'}) {
+    $data = eval {$heap->{'twitter'}->search({query => $heap->{'channels'}->{$chan}->{'topic'}, rpp => 100, since_id => $heap->{'channels'}->{$chan}->{'search_since_id'}});};
+  } else {   
+    $data = eval {$heap->{'twitter'}->search({query => $heap->{'channels'}->{$chan}->{'topic'}, rpp => 100});};
+  }
+
+  if (!$data) {
+    $data = {results => []};
+    $kernel->call($_[SESSION],'twitter_api_error','Unable to update search results.');   
+  } else {
+    $heap->{'channels'}->{$chan}->{'search_since_id'} = $data->{'max_id'};
+    if (@{$data->{'results'}} > 0) {
+      $kernel->post('logger','log','Received '.@{$data->{'results'}}.' search results from Twitter.',$heap->{'username'});
+    }      
+  }
+
+  foreach my $result (sort {$a->{'id'} <=> $b->{'id'}} @{$data->{'results'}}) {
+    if ($result->{'from_user'} ne $heap->{'username'}) {
+      $kernel->yield('user_msg','PRIVMSG',$result->{'from_user'},$chan,$result->{'text'});
+    }
+  }
+
+  $kernel->delay_add('twitter_search',30,$chan);    
 }
 
 __END__

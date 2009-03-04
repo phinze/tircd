@@ -2,6 +2,8 @@ This code is uber alpha, if you got this far, consider yourself lucky
 
 /join #twitter to get started!  
 
+/stats to set configurable options.
+
 Please submit bug reports here: http://code.google.com/p/tircd/issues/list  
 
 Thanks for using tircd,

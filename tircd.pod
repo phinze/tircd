@@ -92,6 +92,14 @@ There is currently no way to get a list of users you've currently blocked via th
 
 To unblock a user /unban them.
 
+=item Multiple Channels / Groups
+
+If you want to create a channel with just a subset of the people you follow, you can /join <any channel> and then /invite them to the channel.  tircd will send a user's updates to #twitter and any other channels you have invited a user to.
+
+=item Search
+
+If you want to have updated search results for a specific term delivered, you can /join <any channel> then set the /topic for the channnel to your search query.  Results that match that query will be sent to that channel. The /topic can be almost anything supported by the twitter search (see http://search.twitter.com/operators for exmaples).  Using the 'near' option is not currently supported.
+
 =back
 
 =head1 AUTHOR
