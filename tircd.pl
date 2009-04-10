@@ -15,7 +15,7 @@ use LWP::UserAgent;
 use Storable;
 use POE qw(Component::Server::TCP Filter::Stackable Filter::Map Filter::IRCD);
 
-my $VERSION = 0.7;
+my $VERSION = 0.8;
 
 #Do some sanity checks on the environment and warn if not what we want
 if ($Net::Twitter::VERSION < 2.10) {
@@ -60,8 +60,8 @@ $filter->push( POE::Filter::Line->new( InputRegexp => '\015?\012', OutputLiteral
 #twitter's json feed escapes < and >, let's fix that
 $filter->push( POE::Filter::Map->new(Code => sub {
   local $_ = shift;
-  s/\&lt\;/\</;
-  s/\&gt\;/\>/;
+  s/\&lt\;/\</g;
+  s/\&gt\;/\>/g;
   return $_;
 }));
 if ($config{'debug'} > 1) {
@@ -269,20 +269,31 @@ sub tircd_login {
   $heap->{'config'}   = eval {retrieve($config{'storage_path'} . '/' . $heap->{'username'} . '.config');};
   $heap->{'channels'} = eval {retrieve($config{'storage_path'} . '/' . $heap->{'username'} . '.channels');};
 
+  my @user_settings = ('update_timeline','update_directs','timeline_count','long_messages','min_length','join_silent','filter_self','shorten_urls','convert_irc_replies');
+
   if (!$heap->{'config'}) {
     my %copy = %config;
     $heap->{'config'} = \%copy;
-    #I need to find a better way to parse out the user/server config items, maybe I'll have to rename them all with server_ / user_ prefixes, but not ready to do that yet
-    delete $heap->{'config'}->{'address'};
-    delete $heap->{'config'}->{'port'};    
-    delete $heap->{'config'}->{'storage_path'};    
-    delete $heap->{'config'}->{'logtype'};    
-    delete $heap->{'config'}->{'logfile'};    
-    delete $heap->{'config'}->{'debug'};
   }
+  foreach my $s (@user_settings) {
+    if (!$heap->{'config'}->{$s}) {
+      $heap->{'config'}->{$s} = $config{$s};
+    }
+  }
+  foreach my $k (keys %{$heap->{'config'}}) {
+    if (!grep($_ eq $k, @user_settings)) {
+      delete $heap->{'config'}->{$k};
+    }
+  }
+
   if (!$heap->{'channels'}) {
     $heap->{'channels'} = {};
   }
+  
+  #we need this for the tinyurl support and others
+  $heap->{'ua'} = LWP::UserAgent->new;
+  $heap->{'ua'}->timeout(10);
+  $heap->{'ua'}->env_proxy();
 
   #some clients need this shit
   $kernel->yield('server_reply','001',"Welcome to tircd $heap->{'username'}");
@@ -717,6 +728,35 @@ sub irc_privmsg {
       $target = '#twitter'; #we want to force all topic changes and what not into twitter for now
     }
 
+    #shorten the URL
+    if (eval("require URI::Find;") && $heap->{'config'}->{'shorten_urls'}) {
+      my $finder = URI::Find->new(sub {
+        my $uriobj = shift;
+        my $uri = shift;
+        
+        if ($uri !~ /^http:/) {
+          return $uri;
+        }
+        
+        my $res = $heap->{'ua'}->get("http://tinyurl.com/api-create.php?url=$uri");
+        if ($res->is_success) {
+          return $res->content;
+        } else {
+          return $uri;
+        }
+      });
+      $finder->find(\$msg);
+    }
+    
+    #Tweak the @replies
+    if ($msg =~ /^(.*?)\: / && $heap->{'config'}->{'convert_irc_replies'}) {
+      my $tnick = $1;
+      if (exists $heap->{'channels'}->{'#twitter'}->{'names'}->{$tnick}) {
+        $msg =~ s/^(.*?)\: /\@$1 /;
+      }
+    }
+    
+
     #in a channel, this an update
     my $update = eval { $heap->{'twitter'}->update($msg) };
     if (!$update && $heap->{'twitter'}->http_code >= 400) {
@@ -996,7 +1036,7 @@ sub twitter_timeline {
   }
 
   #sometimes the twitter API returns undef, so we gotta check here
-  if (!$timeline || @$timeline == 0) {
+  if (!$timeline || @$timeline == 0 || @{$timeline}[0]->{'id'} < $heap->{'timeline_since_id'} ) {
     $timeline = [];
     if ($heap->{'twitter'}->http_code >= 400) {
       $kernel->call($_[SESSION],'twitter_api_error','Unable to update timeline.');   
@@ -1053,12 +1093,15 @@ sub twitter_timeline {
     }
     
     #filter out our own messages / don't display if not in silent mode
-    if ($item->{'user'}->{'screen_name'} ne $heap->{'username'}) {
+    if (($item->{'user'}->{'screen_name'} ne $heap->{'username'} || !$heap->{'config'}->{'filter_self'})) {
       if (!$silent) {
         foreach my $chan (keys %{$heap->{'channels'}}) {
           if ($chan eq '#twitter' || exists $heap->{'channels'}->{$chan}->{'names'}->{$item->{'user'}->{'screen_name'}}) {
             $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},$chan,$item->{'text'});
           }
+          if ($item->{'user'}->{'screen_name'} eq $heap->{'username'}) {
+            $kernel->yield('user_msg','TOPIC',$heap->{'username'},$chan,"$heap->{'username'}'s last update: ".$item->{'text'});
+          }            
         }          
       }        
     }
@@ -1078,7 +1121,7 @@ sub twitter_direct_messages {
     $data = eval { $heap->{'twitter'}->direct_messages() };
   }
 
-  if (!$data || @$data == 0) {
+  if (!$data || @$data == 0 || @{$data}[0]->{'id'} < $heap->{'direct_since_id'}) {
     $data = [];
     if ($heap->{'twitter'}->http_code >= 400) {
       $kernel->call($_[SESSION],'twitter_api_error','Unable to update direct messages.');   
@@ -1127,7 +1170,7 @@ sub twitter_search {
     $data = eval {$heap->{'twitter'}->search({query => $heap->{'channels'}->{$chan}->{'topic'}, rpp => 100});};
   }
 
-  if (!$data) {
+  if (!$data || $data->{'max_id'} < $heap->{'channels'}->{$chan}->{'search_since_id'} ) {
     $data = {results => []};
     $kernel->call($_[SESSION],'twitter_api_error','Unable to update search results.');   
   } else {
