@@ -698,11 +698,6 @@ sub irc_privmsg {
   #this begins the slipperly slope of manipulating user input
   $msg =~ s/\001ACTION (.*)\001/\*$1\*/;
   
-  
-  if ($heap->{'config'}->{'long_messages'} eq 'warn' && length($msg) > 140) {
-      $kernel->yield('server_reply',404,$target,'Your message is '.length($msg).' characters long.  Your message was not sent.');
-      return;
-  }  
 
   if ($heap->{'config'}->{'long_messages'} eq 'split' && length($msg) > 140) {
     my @parts = $msg =~ /(.{1,140})/g;
@@ -755,8 +750,13 @@ sub irc_privmsg {
         $msg =~ s/^(.*?)\: /\@$1 /;
       }
     }
-    
 
+    #warn if asked and the message is too long after fucking with it
+    if ($heap->{'config'}->{'long_messages'} eq 'warn' && length($msg) > 140) {
+      $kernel->yield('server_reply',404,$target,'Your message is '.length($msg).' characters long.  Your message was not sent.');
+      return;
+    }  
+    
     #in a channel, this an update
     my $update = eval { $heap->{'twitter'}->update($msg) };
     if (!$update && $heap->{'twitter'}->http_code >= 400) {
