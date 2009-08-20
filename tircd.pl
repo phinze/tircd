@@ -1165,9 +1165,9 @@ sub twitter_search {
   
   my $data;
   if ($heap->{'channels'}->{$chan}->{'search_since_id'}) {
-    $data = eval {$heap->{'twitter'}->search({query => $heap->{'channels'}->{$chan}->{'topic'}, rpp => 100, since_id => $heap->{'channels'}->{$chan}->{'search_since_id'}});};
+    $data = eval {$heap->{'twitter'}->search({q => $heap->{'channels'}->{$chan}->{'topic'}, rpp => 100, since_id => $heap->{'channels'}->{$chan}->{'search_since_id'}});};
   } else {   
-    $data = eval {$heap->{'twitter'}->search({query => $heap->{'channels'}->{$chan}->{'topic'}, rpp => 100});};
+    $data = eval {$heap->{'twitter'}->search({q => $heap->{'channels'}->{$chan}->{'topic'}, rpp => 100});};
   }
 
   if (!$data || $data->{'max_id'} < $heap->{'channels'}->{$chan}->{'search_since_id'} ) {
