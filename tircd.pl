@@ -62,6 +62,7 @@ $filter->push( POE::Filter::Map->new(Code => sub {
   local $_ = shift;
   s/\&lt\;/\</g;
   s/\&gt\;/\>/g;
+  s/\&quot\;/\"/g;
   return $_;
 }));
 if ($config{'debug'} > 1) {
