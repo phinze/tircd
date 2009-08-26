@@ -1094,7 +1094,7 @@ sub twitter_timeline {
     }
     
     #filter out our own messages / don't display if not in silent mode
-    if (($item->{'user'}->{'screen_name'} ne $heap->{'username'} || !$heap->{'config'}->{'filter_self'})) {
+    if (($item->{'user'}->{'screen_name'} ne lc($heap->{'username'}) || !$heap->{'config'}->{'filter_self'})) {
       if (!$silent) {
         foreach my $chan (keys %{$heap->{'channels'}}) {
           if ($chan eq '#twitter' || exists $heap->{'channels'}->{$chan}->{'names'}->{$item->{'user'}->{'screen_name'}}) {
