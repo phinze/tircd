@@ -738,6 +738,12 @@ sub irc_privmsg {
         if ($uri !~ /^http:/) {
           return $uri;
         }
+
+        # Do not shorten twice - heuristics!
+        if (length($uri) < 30) {
+          return $uri;
+        }
+
         
         my $res = $heap->{'ua'}->get("http://tinyurl.com/api-create.php?url=$uri");
         if ($res->is_success) {
