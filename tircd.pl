@@ -750,11 +750,10 @@ sub irc_privmsg {
     }
     
     #Tweak the @replies
-    if ($msg =~ /^(.*?)\: / && $heap->{'config'}->{'convert_irc_replies'}) {
-      my $tnick = $1;
-      if (exists $heap->{'channels'}->{'#twitter'}->{'names'}->{$tnick}) {
-        $msg =~ s/^(.*?)\: /\@$1 /;
-      }
+    if ($msg =~ /^(\w)\: / && $heap->{'config'}->{'convert_irc_replies'}) {
+      # @Olatho - changing ALL first-words that end with : to @, not only nicks on #Twitter
+      # - I sometimes reply to people that I do not follow, and want them converted as well
+      $msg =~ s/^(\w)\: /\@$1 /;
     }
 
     #warn if asked and the message is too long after fucking with it
