@@ -7,7 +7,7 @@
 
 use strict;
 use JSON::Any;
-use Net::Twitter;
+use Net::Twitter::Lite;
 use Time::Local;
 use File::Glob ':glob';
 use IO::File;
@@ -17,10 +17,11 @@ use POE qw(Component::Server::TCP Filter::Stackable Filter::Map Filter::IRCD);
 
 my $VERSION = 0.8;
 
+# I have no idea what the minimum Net::Twitter::Lite version is
 #Do some sanity checks on the environment and warn if not what we want
-if ($Net::Twitter::VERSION < 2.10) {
-  print "Warning: Your system has an old version of Net::Twitter.  Please upgrade to the current version.\n";
-}
+#if ($Net::Twitter::Lite::VERSION < 2.10) {
+#  print "Warning: Your system has an old version of Net::Twitter::Lite.  Please upgrade to the current version.\n";
+#}
 
 my $j = JSON::Any->new;
 if ($j->handlerType eq 'JSON::Syck') {
@@ -177,15 +178,15 @@ sub logger_log {
 
 #trap twitter api errors
 sub twitter_api_error {
-  my ($kernel,$heap, $msg) = @_[KERNEL, HEAP, ARG0];
+  my ($kernel,$heap, $msg, $error) = @_[KERNEL, HEAP, ARG0, ARG1];
   
   if ($config{'debug'}) {
-    $kernel->post('logger','log',$heap->{'twitter'}->http_message.' '.$heap->{'twitter'}->http_code.' '.$heap->{'twitter'}->get_error,'debug/twitter_api_error');
+    $kernel->post('logger','log',$error->message().' '.$error->code().' '.$error,'debug/twitter_api_error');
   }
 
-  $kernel->post('logger','log',$msg.' ('.$heap->{'twitter'}->http_code .' from Twitter API).',$heap->{'username'});  
+  $kernel->post('logger','log',$msg.' ('.$error->code() .' from Twitter API).',$heap->{'username'});  
 
-  if ($heap->{'twitter'}->http_code == 400) {
+  if ($error->code() == 400) {
     $msg .= ' Twitter API limit reached.';
   } else {
     $msg .= ' Twitter Fail Whale.';
@@ -250,7 +251,7 @@ sub tircd_login {
   }
 
   #start up the twitter interface, and see if we can connect with the given NICK/PASS INFO
-  my $twitter = Net::Twitter->new(username => $heap->{'username'}, password => $heap->{'password'}, source => 'tircd');
+  my $twitter = Net::Twitter::Lite->new(username => $heap->{'username'}, password => $heap->{'password'}, source => 'tircd');
   if (!eval { $twitter->verify_credentials() }) {
     $kernel->post('logger','log','Unable to login to Twitter with the supplied credentials.',$heap->{'username'});
     $kernel->yield('server_reply',462,'Unable to login to Twitter with the supplied credentials.');
@@ -531,11 +532,12 @@ sub irc_mode { #ignore all mode requests except ban which is a block (send back 
     if ($target eq '#twitter') {
       if ($mode eq '+b' && $target eq '#twitter') {
         my $user = eval { $heap->{'twitter'}->create_block($nick) };
+        my $error = $@;
         if ($user) {
           $kernel->yield('user_msg','MODE',$heap->{'username'},$target,$mode,$opts);
         } else {
-          if ($heap->{'twitter'}->http_code >= 400) {
-            $kernel->call($_[SESSION],'twitter_api_error','Unable to block user.');
+          if (ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+            $kernel->call($_[SESSION],'twitter_api_error','Unable to block user.',$error);
           } else {
             $kernel->yield('server_reply',401,$nick,'No such nick/channel');
           }
@@ -543,11 +545,12 @@ sub irc_mode { #ignore all mode requests except ban which is a block (send back 
         return;        
       } elsif ($mode eq '-b' && $target eq '#twitter') {
         my $user = eval { $heap->{'twitter'}->destroy_block($nick) };
+        my $error = $@;
         if ($user) {
           $kernel->yield('user_msg','MODE',$heap->{'username'},$target,$mode,$opts);
         } else {
-          if ($heap->{'twitter'}->http_code >= 400) {
-            $kernel->call($_[SESSION],'twitter_api_error','Unable to unblock user.');
+          if (ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+            $kernel->call($_[SESSION],'twitter_api_error','Unable to unblock user.',$error);
           } else {
             $kernel->yield('server_reply',401,$nick,'No such nick/channel');
           }
@@ -590,19 +593,21 @@ sub irc_whois {
   
   my $friend = $kernel->call($_[SESSION],'getfriend',$target);
   my $isfriend = 1;
+  my $error;
   
   if (!$friend) {#if we don't have their info already try to get it from twitter, and track it for the end of this function
     $friend = eval { $heap->{'twitter'}->show_user($target) };
+    $error = $@;
     $isfriend = 0;
   }
 
-  if ($heap->{'twitter'}->http_code == 404) {
+  if (ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() == 404) {
     $kernel->yield('server_reply',402,$target,'No such server');
     return;
   }
 
-  if (!$friend && $heap->{'twitter'}->http_code >= 400) {
-    $kernel->call($_[SESSION],'twitter_api_error','Unable to get user information.');
+  if (!$friend && ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+    $kernel->call($_[SESSION],'twitter_api_error','Unable to get user information.',$error);
     return;
   }        
 
@@ -760,8 +765,9 @@ sub irc_privmsg {
     
     #in a channel, this an update
     my $update = eval { $heap->{'twitter'}->update($msg) };
-    if (!$update && $heap->{'twitter'}->http_code >= 400) {
-      $kernel->call($_[SESSION],'twitter_api_error','Unable to update status.');
+    my $error = $@;
+    if (!$update && ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+      $kernel->call($_[SESSION],'twitter_api_error','Unable to update status.',$error);
       return;
     } 
 
@@ -820,6 +826,7 @@ sub irc_invite {
 
   #if it's the main channel, we'll start following them on twitter
   my $user = eval { $heap->{'twitter'}->create_friend({id => $target}) };
+  my $error = $@;
   if ($user) {
     if (!$user->{'protected'}) {
       #if the user isn't protected, and we are following them now, then have 'em 'JOIN' the channel
@@ -840,8 +847,8 @@ sub irc_invite {
       $kernel->post('logger','log',"Sent request to follow $target",$heap->{'username'});      
     }
   } else {
-    if ($heap->{'twitter'}->http_code >= 400 && $heap->{'twitter'}->http_code != 403) {
-      $kernel->call($_[SESSION],'twitter_api_error','Unable to follow user.');    
+    if (ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400 && $error->code() != 403) {
+      $kernel->call($_[SESSION],'twitter_api_error','Unable to follow user.',$error);    
     } else {
       $kernel->yield('server_reply',401,$target,'No such nick/channel');
       $kernel->post('logger','log',"Attempted to follow non-existant user $target",$heap->{'username'});      
@@ -873,14 +880,15 @@ sub irc_kick {
   }
   
   my $result = eval { $heap->{'twitter'}->destroy_friend($target) };
+  my $error = $@;
   if ($result) {
     $kernel->call($_[SESSION],'remfriend',$target);
     delete $heap->{'channels'}->{$chan}->{'names'}->{$target};
     $kernel->yield('user_msg','KICK',$heap->{'username'},$chan,$target,$target);
     $kernel->post('logger','log',"Stoped following $target",$heap->{'username'});
   } else {
-    if ($heap->{'twitter'}->http_code >= 400) {
-      $kernel->call($_[SESSION],'twitter_api_error','Unable to unfollow user.');    
+    if (ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+      $kernel->call($_[SESSION],'twitter_api_error','Unable to unfollow user.',$error);    
     } else {
       $kernel->yield('server_reply',441,$target,$chan,"They aren't on that channel");  
       $kernel->post('logger','log',"Attempted to unfollow user ($target) we weren't following",$heap->{'username'});
@@ -948,10 +956,11 @@ sub channel_twitter {
     push(@friends,@$f);
     $page++;
   }
+  my $error = $@;
 
   #if we have no data, there was an error, or the user is a loser with no friends, eject 'em
-  if ($page == 1 && $heap->{'twitter'}->http_code >= 400) {
-    $kernel->call($_[SESSION],'twitter_api_error','Unable to get friends list.');
+  if ($page == 1 && ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+    $kernel->call($_[SESSION],'twitter_api_error','Unable to get friends list.',$error);
     return;
   } 
 
@@ -963,10 +972,11 @@ sub channel_twitter {
     push(@followers,@$f);
     $page++;
   }
+  $error = $@;
 
   #alert this error, but don't end 'em
-  if ($page == 1 && $heap->{'twitter'}->http_code >= 400) {
-    $kernel->call($_[SESSION],'twitter_api_error','Unable to get followers list.');
+  if ($page == 1 && ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+    $kernel->call($_[SESSION],'twitter_api_error','Unable to get followers list.',$error);
   } 
 
   #cache our friends and followers
@@ -1030,17 +1040,20 @@ sub twitter_timeline {
 
   #get updated messages
   my $timeline;
+  my $error;
   if ($heap->{'timeline_since_id'}) {
     $timeline = eval { $heap->{'twitter'}->friends_timeline({count => $heap->{'config'}->{'timeline_count'}, since_id => $heap->{'timeline_since_id'}}) };
+    $error = $@;
   } else {
     $timeline = eval { $heap->{'twitter'}->friends_timeline({count => $heap->{'config'}->{'timeline_count'}}) };
+    $error = $@;
   }
 
   #sometimes the twitter API returns undef, so we gotta check here
   if (!$timeline || @$timeline == 0 || @{$timeline}[0]->{'id'} < $heap->{'timeline_since_id'} ) {
     $timeline = [];
-    if ($heap->{'twitter'}->http_code >= 400) {
-      $kernel->call($_[SESSION],'twitter_api_error','Unable to update timeline.');   
+    if (ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+      $kernel->call($_[SESSION],'twitter_api_error','Unable to update timeline.',$error);   
     }
   } else {
     #if we got new data save our position
@@ -1052,14 +1065,16 @@ sub twitter_timeline {
   my $replies;
   if ($heap->{'replies_since_id'}) {
     $replies = eval { $heap->{'twitter'}->replies({since_id => $heap->{'replies_since_id'}}) };
+    $error = $@;
   } else {
     $replies = eval { $heap->{'twitter'}->replies({page =>1}) }; #avoid a bug in Net::Twitter
+    $error = $@;
   }
 
   if (!$replies || @$replies == 0) {
     $replies = [];
-    if ($heap->{'twitter'}->http_code >= 400) {
-      $kernel->call($_[SESSION],'twitter_api_error','Unable to update @replies.');   
+    if (ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+      $kernel->call($_[SESSION],'twitter_api_error','Unable to update @replies.',$error);   
     }
   } else {  
     $heap->{'replies_since_id'} = @{$replies}[0]->{'id'};
@@ -1116,16 +1131,19 @@ sub twitter_direct_messages {
   my ($kernel, $heap, $silent) = @_[KERNEL, HEAP, ARG0];
 
   my $data;
+  my $error;
   if ($heap->{'direct_since_id'}) {
     $data = eval { $heap->{'twitter'}->direct_messages({since_id => $heap->{'direct_since_id'}}) };
+    $error = $@;
   } else {
     $data = eval { $heap->{'twitter'}->direct_messages() };
+    $error = $@;
   }
 
   if (!$data || @$data == 0 || @{$data}[0]->{'id'} < $heap->{'direct_since_id'}) {
     $data = [];
-    if ($heap->{'twitter'}->http_code >= 400) {
-      $kernel->call($_[SESSION],'twitter_api_error','Unable to update direct messages.');   
+    if (ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+      $kernel->call($_[SESSION],'twitter_api_error','Unable to update direct messages.',$error);   
     }
   } else {
     $heap->{'direct_since_id'} = @{$data}[0]->{'id'};
@@ -1165,15 +1183,18 @@ sub twitter_search {
   }
   
   my $data;
+  my $error;
   if ($heap->{'channels'}->{$chan}->{'search_since_id'}) {
     $data = eval {$heap->{'twitter'}->search({q => $heap->{'channels'}->{$chan}->{'topic'}, rpp => 100, since_id => $heap->{'channels'}->{$chan}->{'search_since_id'}});};
+    $error = $@;
   } else {   
     $data = eval {$heap->{'twitter'}->search({q => $heap->{'channels'}->{$chan}->{'topic'}, rpp => 100});};
+    $error = $@;
   }
 
   if (!$data || $data->{'max_id'} < $heap->{'channels'}->{$chan}->{'search_since_id'} ) {
     $data = {results => []};
-    $kernel->call($_[SESSION],'twitter_api_error','Unable to update search results.');   
+    $kernel->call($_[SESSION],'twitter_api_error','Unable to update search results.',$error);   
   } else {
     $heap->{'channels'}->{$chan}->{'search_since_id'} = $data->{'max_id'};
     if (@{$data->{'results'}} > 0) {

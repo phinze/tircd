@@ -14,11 +14,11 @@ L<POE>
 
 L<POE::Filter::IRCD>
 
-L<Net::Twitter>
+L<Net::Twitter::Lite>
 
 You can install them all by running:
 
-C<cpan -i POE POE::Filter::IRCD Net::Twitter>
+C<cpan -i POE POE::Filter::IRCD Net::Twitter::Lite>
 
 =head1 USAGE
 
@@ -116,4 +116,4 @@ L<POE>
 
 L<POE::Filter::IRCD>
 
-L<Net::Twitter>
+L<Net::Twitter::Lite>
