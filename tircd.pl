@@ -950,32 +950,41 @@ sub channel_twitter {
 
   #get list of friends
   my @friends = ();
-  my $page = 1;  
-  while (my $f = eval { $heap->{'twitter'}->friends({page => $page}) }) {
-    last if @$f == 0;    
-    push(@friends,@$f);
-    $page++;
+  my $cursor = -1;
+  my $error;
+  while (my $f = eval { $heap->{'twitter'}->friends({'cursor' => $cursor})}) {
+    $cursor = $f->{'next_cursor'};
+    foreach my $user ($f->{'users'}) {
+      foreach my $u (@{$user}) {
+        push(@friends, $u);
+      }
+    }
+    last if $cursor == 0;
   }
   my $error = $@;
 
   #if we have no data, there was an error, or the user is a loser with no friends, eject 'em
-  if ($page == 1 && ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+  if ($cursor == -1 && ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
     $kernel->call($_[SESSION],'twitter_api_error','Unable to get friends list.',$error);
     return;
   } 
 
-  #get list of friends
+  #get list of followers
   my @followers = ();
-  my $page = 1;  
-  while (my $f = eval { $heap->{'twitter'}->followers({page => $page}) }) {
-    last if @$f == 0;    
-    push(@followers,@$f);
-    $page++;
+  $cursor = -1;
+  while (my $f = eval { $heap->{'twitter'}->followers({'cursor' => $cursor}) }) {
+    $cursor = $f->{'next_cursor'};
+    foreach my $user ($f->{'users'}) {
+      foreach my $u (@{$user}) {
+        push(@followers, $u);
+      }
+    }
+    last if $cursor == 0;
   }
   $error = $@;
 
   #alert this error, but don't end 'em
-  if ($page == 1 && ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+  if ($cursor == -1 && ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
     $kernel->call($_[SESSION],'twitter_api_error','Unable to get followers list.',$error);
   } 
 
