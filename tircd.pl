@@ -14,6 +14,7 @@ use IO::File;
 use LWP::UserAgent;
 use Storable;
 use POE qw(Component::Server::TCP Filter::Stackable Filter::Map Filter::IRCD);
+use URI qw/host/;
 
 my $VERSION = 0.8;
 
@@ -72,6 +73,15 @@ if ($config{'debug'} > 1) {
   $filter->push(POE::Filter::IRCD->new(debug => 0));
 }
 
+# if configured to use SSL, and no env vars yet defined, set to config settings
+if ($config{'use_ssl'} == 1 && !($ENV{'HTTPS_CA_FILE'} || $ENV{'HTTPS_CA_DIR'})) {
+	if ($config{'https_ca_file'} and -e $config{'https_ca_file'}) {
+		$ENV{'HTTPS_CA_FILE'} = $config{'https_ca_file'};
+	} elsif ($config{'https_ca_dir'} && -d $config{'https_ca_dir'}) {
+		$ENV{'HTTPS_CA_DIR'} = $config{'https_ca_dir'};
+	}
+}
+
 #if needed setup our logging sesstion
 if ($config{'logtype'} ne 'none') {
   POE::Session->create(
@@ -121,7 +131,8 @@ POE::Component::Server::TCP->new(
     getfriend => \&tircd_getfriend,
     remfriend => \&tircd_remfriend,
     updatefriend => \&tircd_updatefriend,
-    getfollower => \&tircd_getfollower
+    getfollower => \&tircd_getfollower,
+
     
   },
   ClientFilter		=> $filter, 
@@ -244,73 +255,123 @@ sub tircd_remfriend {
 
 #called once we have a user/pass, attempts to auth with twitter
 sub tircd_login {
-  my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
-  
-  if ($heap->{'twitter'}) { #make sure we aren't called twice
-    return;
-  }
+	my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
 
-  #start up the twitter interface, and see if we can connect with the given NICK/PASS INFO
-  my $twitter = Net::Twitter::Lite->new(username => $heap->{'username'}, password => $heap->{'password'}, source => 'tircd');
-  if (!eval { $twitter->verify_credentials() }) {
-    $kernel->post('logger','log','Unable to login to Twitter with the supplied credentials.',$heap->{'username'});
-    $kernel->yield('server_reply',462,'Unable to login to Twitter with the supplied credentials.');
-    $kernel->yield('shutdown'); #disconnect 'em if we cant
-    return;
-  }
+	if ($heap->{'twitter'}) { #make sure we aren't called twice
+		return;
+	}
 
-  $kernel->post('logger','log','Successfully authenticated with Twitter.',$heap->{'username'});
+	# unless we have a bundle or directory of certs to verify against, ssl is b0rked
+	if ($config{'use_ssl'}) {
+		unless($ENV{'HTTPS_CA_FILE'} or $ENV{'HTTPS_CA_DIR'}) {
+			$kernel->yield('logger','log',"You must provide the environment variable HTTPS_CA_FILE or HTTPS_CA_DIR before starting tircd.pl in order to verify SSL certificates.");
+			$kernel->yield('server_reply',462,'Unable to verify SSL certificate');
+			$kernel->yield('shutdown'); #disconnect 'em if we cant
+				return;
+		}
+	}
 
-  #stash the twitter object for use in the session  
-  $heap->{'twitter'} = $twitter;
+	# base Net::Twitter::Lite object, add credentials after (possible) ssl check
+	my $twitter = Net::Twitter::Lite->new(ssl=> $config{'use_ssl'}, source => 'tircd');
+	# check ssl cert using LWP
+	my $sslcheck = LWP::UserAgent->new;
+	my $apiurl = URI->new($twitter->{'apiurl'});
+	# second level domain, aka domain.tld. if this is present in the certificate, we are happy
+	my $SLD = $apiurl->host;
+	$SLD =~ s/.*\.([^.]*\.[^.]*)/$1/;;
 
-  #stash the username in a list to keep 'em from rejoining
-  $users{$heap->{'username'}} = 1;
 
-  #load our configs from disk if they exist
-  $heap->{'config'}   = eval {retrieve($config{'storage_path'} . '/' . $heap->{'username'} . '.config');};
-  $heap->{'channels'} = eval {retrieve($config{'storage_path'} . '/' . $heap->{'username'} . '.channels');};
 
-  my @user_settings = ('update_timeline','update_directs','timeline_count','long_messages','min_length','join_silent','filter_self','shorten_urls','convert_irc_replies');
+	# if-ssl-cert-subject causes the certificate subject line to be checked against the regex in its value
+	# upon checking the certificate, it will cancel the request and set the HTTP::Response is_error to 1 for us
+	$sslcheck->default_header("If-SSL-Cert-Subject" => "CN=(.*\.){0,1}$SLD");
+	# knock politely
+	my $sslresp = $sslcheck->get($apiurl); 
+	print $apiurl . "\n";
 
-  if (!$heap->{'config'}) {
-    my %copy = %config;
-    $heap->{'config'} = \%copy;
-  }
-  foreach my $s (@user_settings) {
-    if (!$heap->{'config'}->{$s}) {
-      $heap->{'config'}->{$s} = $config{$s};
-    }
-  }
-  foreach my $k (keys %{$heap->{'config'}}) {
-    if (!grep($_ eq $k, @user_settings)) {
-      delete $heap->{'config'}->{$k};
-    }
-  }
+	# cert failed to verify against local bundle/ca_dir
+	if( $sslresp->header('client-ssl-warning') ) {
+		$kernel->yield('logger','log',"Unable to verify server certificate against local authority.");
+		$kernel->yield('server_reply',462,'Unable to verify SSL certificate.');
+		$kernel->yield('shutdown'); 
+		return;
+	}
 
-  if (!$heap->{'channels'}) {
-    $heap->{'channels'} = {};
-  }
-  
-  #we need this for the tinyurl support and others
-  $heap->{'ua'} = LWP::UserAgent->new;
-  $heap->{'ua'}->timeout(10);
-  $heap->{'ua'}->env_proxy();
+	# cert response failed to be for expected domain
+	if( $sslresp->is_error && $sslresp->code == 500 ) {
+		$kernel->yield('logger','log',"Hostname (CN) of SSL certificate did not match domain being accessed, someone is doing something nasty!");
+		$kernel->yield('server_reply',462,'SSL certificate has invalid Common Name (CN).');
+		$kernel->yield('shutdown'); 
+		return;
+	}
 
-  #some clients need this shit
-  $kernel->yield('server_reply','001',"Welcome to tircd $heap->{'username'}");
-  $kernel->yield('server_reply','002',"Your host is tircd running version $VERSION");
-  $kernel->yield('server_reply','003',"This server was created just for you!");
-  $kernel->yield('server_reply','004',"tircd $VERSION i int");
 
-  #show 'em the motd
-  $kernel->yield('MOTD');  
+
+	#start up the twitter interface, and see if we can connect with the given NICK/PASS INFO
+	$twitter->credentials($heap->{'username'}, $heap->{'password'});
+	if (!eval { $twitter->verify_credentials() }) {
+		$kernel->post('logger','log','Unable to login to Twitter with the supplied credentials.',$heap->{'username'});
+		$kernel->yield('server_reply',462,'Unable to login to Twitter with the supplied credentials.');
+		$kernel->yield('shutdown'); #disconnect 'em if we cant
+			return;
+	}
+
+	$kernel->post('logger','log','Successfully authenticated with Twitter.',$heap->{'username'});
+
+	#stash the twitter object for use in the session  
+	$heap->{'twitter'} = $twitter;
+
+	#stash the username in a list to keep 'em from rejoining
+	$users{$heap->{'username'}} = 1;
+
+	#load our configs from disk if they exist
+	if (-d $config{'storage_path'}) {
+		$heap->{'config'}   = eval {retrieve($config{'storage_path'} . '/' . $heap->{'username'} . '.config');};
+		$heap->{'channels'} = eval {retrieve($config{'storage_path'} . '/' . $heap->{'username'} . '.channels');};
+	} 
+
+	my @user_settings = qw(update_timeline update_directs timeline_count long_messages min_length join_silent filter_self shorten_urls convert_irc_replies);
+
+	# copy base config for user if prior config failed to exist/retrieve
+	if (!$heap->{'config'}) {
+		my %copy = %config;
+		$heap->{'config'} = \%copy;
+	}
+	foreach my $s (@user_settings) {
+		if (!$heap->{'config'}->{$s}) {
+			$heap->{'config'}->{$s} = $config{$s};
+		}
+	}
+	foreach my $k (keys %{$heap->{'config'}}) {
+		if (!grep($_ eq $k, @user_settings)) {
+			delete $heap->{'config'}->{$k};
+		}
+	}
+
+	if (!$heap->{'channels'}) {
+		$heap->{'channels'} = {};
+	}
+
+	#we need this for the tinyurl support and others
+	$heap->{'ua'} = LWP::UserAgent->new;
+	$heap->{'ua'}->timeout(10);
+	$heap->{'ua'}->env_proxy();
+
+	#some clients need this shit
+	$kernel->yield('server_reply','001',"Welcome to tircd $heap->{'username'}");
+	$kernel->yield('server_reply','002',"Your host is tircd running version $VERSION");
+	$kernel->yield('server_reply','003',"This server was created just for you!");
+	$kernel->yield('server_reply','004',"tircd $VERSION i int");
+
+	#show 'em the motd
+	$kernel->yield('MOTD');  
 }
 
 sub tircd_connect {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
   $kernel->post('logger','log',$heap->{'remote_ip'}.' connected.');
 }
+
 
 sub tircd_cleanup {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
@@ -322,6 +383,14 @@ sub tircd_cleanup {
   #remove our timers so the session will die
   $kernel->delay('twitter_timeline');  
   $kernel->delay('twitter_direct_messages');
+
+  # if storage_path directory doesn't exist, attempt to create
+  unless ( -e $config{'storage_path'} && -d $config{'storage_path'} ) {
+	  mkdir $config{'storage_path'};
+	  if ($!) {
+		  $kernel->post('logger','log','Was unable to create storage_dir at ' . $config{'storage_path'} . '.' . $!);  
+	  }
+  }
   
   #if defined, save our data for next time
   if ($config{'storage_path'} && -d $config{'storage_path'} && -w $config{'storage_path'}) {
@@ -685,7 +754,7 @@ sub irc_stats {
     }
     $kernel->yield('server_reply',212,$key,"Use '/stats <key> <value>' to change a setting.");
     $kernel->yield('server_reply',212,$key,"Example: /stats join_silent 1");
-  } else {
+   } else {
     if (exists $heap->{'config'}->{$key}) {
       $heap->{'config'}->{$key} = $val;
       $kernel->yield('server_reply',212,$key,"set to $val");

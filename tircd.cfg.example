@@ -8,6 +8,19 @@
 address 127.0.0.1
 port 6667
 
+
+## SSL Support
+# set use_ssl to 1 to have the tircd daemon use SSL when connecting to twitter
+use_ssl 0
+# If tircd is not being started with either HTTPS_CA_FILE or HTTPS_CA_DIR 
+# environment variable set, AT LEAST one of the following must be set. These
+# tell Crypt::SSLeay where to find the local root certificate store.
+# https_ca_dir  /usr/share/ca-certificates/
+# https_ca_file /etc/certs/ca-bundle.crt 
+https_ca_dir 
+https_ca_file 
+
+
 # This controls where tircd will store it's configuration data
 # This is used to store per-user preferences and channel lineups
 # If not set, data will not be saved between user sessions
