@@ -287,7 +287,6 @@ sub tircd_login {
 	$sslcheck->default_header("If-SSL-Cert-Subject" => "CN=(.*\.){0,1}$SLD");
 	# knock politely
 	my $sslresp = $sslcheck->get($apiurl); 
-	print $apiurl . "\n";
 
 	# cert failed to verify against local bundle/ca_dir
 	if( $sslresp->header('client-ssl-warning') ) {
