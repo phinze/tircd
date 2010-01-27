@@ -133,6 +133,8 @@ POE::Component::Server::TCP->new(
     updatefriend => \&tircd_updatefriend,
     getfollower => \&tircd_getfollower,
 
+	 verify_ssl => \&tircd_verify_ssl,
+
     
   },
   ClientFilter		=> $filter, 
@@ -256,6 +258,7 @@ sub tircd_remfriend {
 #called once we have a user/pass, attempts to auth with twitter
 sub tircd_login {
 	my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
+	my $twitter = Net::Twitter::Lite->new(ssl=> $config{'use_ssl'}, source => 'tircd');
 
 	if ($heap->{'twitter'}) { #make sure we aren't called twice
 		return;
@@ -263,47 +266,9 @@ sub tircd_login {
 
 	# unless we have a bundle or directory of certs to verify against, ssl is b0rked
 	if ($config{'use_ssl'}) {
-		unless($ENV{'HTTPS_CA_FILE'} or $ENV{'HTTPS_CA_DIR'}) {
-			$kernel->yield('logger','log',"You must provide the environment variable HTTPS_CA_FILE or HTTPS_CA_DIR before starting tircd.pl in order to verify SSL certificates.");
-			$kernel->yield('server_reply',462,'Unable to verify SSL certificate');
-			$kernel->yield('shutdown'); #disconnect 'em if we cant
-				return;
-		}
+		# verify_ssl will drop user if SSL checks fail
+		return unless($kernel->call($_[SESSION],'verify_ssl'));
 	}
-
-	# base Net::Twitter::Lite object, add credentials after (possible) ssl check
-	my $twitter = Net::Twitter::Lite->new(ssl=> $config{'use_ssl'}, source => 'tircd');
-	# check ssl cert using LWP
-	my $sslcheck = LWP::UserAgent->new;
-	my $apiurl = URI->new($twitter->{'apiurl'});
-	# second level domain, aka domain.tld. if this is present in the certificate, we are happy
-	my $SLD = $apiurl->host;
-	$SLD =~ s/.*\.([^.]*\.[^.]*)/$1/;;
-
-
-
-	# if-ssl-cert-subject causes the certificate subject line to be checked against the regex in its value
-	# upon checking the certificate, it will cancel the request and set the HTTP::Response is_error to 1 for us
-	$sslcheck->default_header("If-SSL-Cert-Subject" => "CN=(.*\.){0,1}$SLD");
-	# knock politely
-	my $sslresp = $sslcheck->get($apiurl); 
-
-	# cert failed to verify against local bundle/ca_dir
-	if( $sslresp->header('client-ssl-warning') ) {
-		$kernel->yield('logger','log',"Unable to verify server certificate against local authority.");
-		$kernel->yield('server_reply',462,'Unable to verify SSL certificate.');
-		$kernel->yield('shutdown'); 
-		return;
-	}
-
-	# cert response failed to be for expected domain
-	if( $sslresp->is_error && $sslresp->code == 500 ) {
-		$kernel->yield('logger','log',"Hostname (CN) of SSL certificate did not match domain being accessed, someone is doing something nasty!");
-		$kernel->yield('server_reply',462,'SSL certificate has invalid Common Name (CN).');
-		$kernel->yield('shutdown'); 
-		return;
-	}
-
 
 
 	#start up the twitter interface, and see if we can connect with the given NICK/PASS INFO
@@ -364,6 +329,52 @@ sub tircd_login {
 
 	#show 'em the motd
 	$kernel->yield('MOTD');  
+}
+
+sub tircd_verify_ssl {
+	my($kernel) = @_[KERNEL];
+	# unless we have a bundle or directory of certs to verify against, ssl is b0rked
+	unless($ENV{'HTTPS_CA_FILE'} or $ENV{'HTTPS_CA_DIR'}) {
+		$kernel->yield('logger','log',"You must provide the environment variable HTTPS_CA_FILE or HTTPS_CA_DIR before starting tircd.pl in order to verify SSL certificates.");
+		$kernel->yield('server_reply',462,'Unable to verify SSL certificate');
+		$kernel->yield('shutdown'); #disconnect 'em if we cant
+		return;
+	}
+
+	# check ssl cert using LWP
+	my $api_check = Net::Twitter::Lite->new;
+	my $sslcheck = LWP::UserAgent->new;
+	my $apiurl = URI->new($api_check->{'apiurl'});
+	# second level domain, aka domain.tld. if this is present in the certificate, we are happy
+	my $SLD = $apiurl->host;
+	$SLD =~ s/.*\.([^.]*\.[^.]*)/$1/;;
+
+
+
+	# if-ssl-cert-subject causes the certificate subject line to be checked against the regex in its value
+	# upon checking the certificate, it will cancel the request and set the HTTP::Response is_error to 1 for us
+	$sslcheck->default_header("If-SSL-Cert-Subject" => "CN=(.*\.){0,1}$SLD");
+	# knock politely
+	my $sslresp = $sslcheck->get($apiurl); 
+
+	# cert failed to verify against local bundle/ca_dir
+	if( $sslresp->header('client-ssl-warning') ) {
+		$kernel->yield('logger','log',"Unable to verify server certificate against local authority.");
+		$kernel->yield('server_reply',462,'Unable to verify SSL certificate.');
+		$kernel->yield('shutdown'); 
+		return;
+	}
+
+	# cert response failed to be for expected domain
+	if( $sslresp->is_error && $sslresp->code == 500 ) {
+		$kernel->yield('logger','log',"Hostname (CN) of SSL certificate did not match domain being accessed, someone is doing something nasty!");
+		$kernel->yield('server_reply',462,'SSL certificate has invalid Common Name (CN).');
+		$kernel->yield('shutdown'); 
+		return;
+	}
+
+	# all SLL checks passed
+	return 1;
 }
 
 sub tircd_connect {
