@@ -17,6 +17,9 @@ use POE qw(Component::Server::TCP Filter::Stackable Filter::Map Filter::IRCD);
 use URI qw/host/;
 
 my $VERSION = 0.8;
+# consumer key/secret in the executable instead of config because it should not be edited by user
+my $tw_oauth_con_key = "4AQca4GFiWWaifUknq35Q";
+my $tw_oauth_con_sec = "VB0exmHlErkx4GUUsXvoR4bqaXi56Rl43NL1Z9Q";
 
 # I have no idea what the minimum Net::Twitter::Lite version is
 #Do some sanity checks on the environment and warn if not what we want
@@ -134,6 +137,13 @@ POE::Component::Server::TCP->new(
     getfollower => \&tircd_getfollower,
 
 	 verify_ssl => \&tircd_verify_ssl,
+	 basicauth_login => \&twitter_basic_login,
+	 setup_authenticated_user => \&tircd_setup_authenticated_user,
+	 oauth_login_begin => \&twitter_oauth_login_begin,
+	 oauth_login_finish => \&twitter_oauth_login_finish,
+	 oauth_pin_ask => \&twitter_oauth_pin_ask,
+	 oauth_pin_entry => \&twitter_oauth_pin_entry,
+	 no_pin_received => \&tircd_oauth_no_pin_received,
 
     
   },
@@ -258,35 +268,154 @@ sub tircd_remfriend {
 #called once we have a user/pass, attempts to auth with twitter
 sub tircd_login {
 	my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
-	my $twitter = Net::Twitter::Lite->new(ssl=> $config{'use_ssl'}, source => 'tircd');
 
 	if ($heap->{'twitter'}) { #make sure we aren't called twice
 		return;
 	}
 
-	# unless we have a bundle or directory of certs to verify against, ssl is b0rked
+	$heap->{'nt_params'}{'source'} = "tircd";
+
+	# use SSL?
 	if ($config{'use_ssl'}) {
+		$heap->{'nt_params'}{'ssl'} = 1;
 		# verify_ssl will drop user if SSL checks fail
 		return unless($kernel->call($_[SESSION],'verify_ssl'));
 	}
 
+	# kick off specified authentication flow
+	# username oauth is (currently) reserved on twitter, can be used to pick login
+	if ($heap->{'username'} =~ /^oauth$/i) {
+		return $kernel->call($_[SESSION],'oauth_login_begin');
+	} else {
+		return $kernel->call($_[SESSION],'basicauth_login');
+	}
+}
+
+# Login methods
+
+# basic auth code from original tircd_login sub
+sub twitter_basic_login {
+	my ($kernel, $heap) = @_[KERNEL, HEAP];
+
+	$heap->{'nt_params'}{'username'} = $heap->{'username'};
+	$heap->{'nt_params'}{'password'} = $heap->{'password'};
 
 	#start up the twitter interface, and see if we can connect with the given NICK/PASS INFO
-	$twitter->credentials($heap->{'username'}, $heap->{'password'});
-	if (!eval { $twitter->verify_credentials() }) {
+	$heap->{'twitter'} = Net::Twitter::Lite->new(%{ $heap->{'nt_params'} });
+
+	unless (eval{ $heap->{'twitter'}->verify_credentials() }) {
 		$kernel->post('logger','log','Unable to login to Twitter with the supplied credentials.',$heap->{'username'});
 		$kernel->yield('server_reply',462,'Unable to login to Twitter with the supplied credentials.');
 		$kernel->yield('shutdown'); #disconnect 'em if we cant
-			return;
+		return;
 	}
 
 	$kernel->post('logger','log','Successfully authenticated with Twitter.',$heap->{'username'});
 
-	#stash the twitter object for use in the session  
-	$heap->{'twitter'} = $twitter;
 
-	#stash the username in a list to keep 'em from rejoining
-	$users{$heap->{'username'}} = 1;
+	$kernel->yield('setup_authenticated_user');
+	return 1;
+}
+
+# called by tircd_login when username set to oauth
+sub twitter_oauth_login_begin {
+	my ($kernel, $heap) = @_[KERNEL, HEAP];
+	$heap->{'nt_params'}{'consumer_key'} = $tw_oauth_con_key;
+	$heap->{'nt_params'}{'consumer_secret'} = $tw_oauth_con_sec;
+
+	eval "use Net::OAuth 0.16";
+	if ($@) {
+		$kernel->yield('server_reply',463,'Net::OAuth >= 0.16 is not installed');
+		$kernel->yield('server_reply',463,'OAuth authentication requires Net::OAuth version 0.16 or greater.');
+		$kernel->yield('shutdown');
+	}
+
+	$kernel->yield('server_reply',463,'OAuth authentication selected.');
+
+	$heap->{'twitter'} = Net::Twitter::Lite->new(%{$heap->{'nt_params'}});
+
+	# if tokens in config, try to re-use
+	# TODO allow users to specify no store of access tokens
+	if ($heap->{'config'}->{'access_token'} && $heap->{'config'}->{'access_token_secret'} && $heap->{'config'}->{'username'}) {
+		$heap->{'twitter'}->access_token($heap->{'config'}->{'access_token'});
+		$heap->{'twitter'}->access_token_secret($heap->{'config'}->{'access_token_secret'});
+		$heap->{'username'} = $heap->{'config'}->{'username'};
+		return if $kernel->call($_[SESSION],'oauth_login_finish');
+	}
+
+	unless($heap->{'twitter'}->authorized) {
+		$kernel->call($_[SESSION],'oauth_pin_ask');
+	}
+
+	return 1;
+}
+
+# direct user to pin site
+sub twitter_oauth_pin_ask {
+	my ($kernel, $heap) = @_[KERNEL,HEAP];
+	$kernel->yield('server_reply',463,"Please authorize this connection at:");
+	$kernel->yield('server_reply',463,$heap->{'twitter'}->get_authentication_url);
+	$kernel->yield('server_reply',463,"To continue connecting, type /stats pin <PIN>, where <PIN> is the PIN returned by the twitter authorize page.");
+	# half an hour until disconnect
+	$kernel->alarm('no_pin_received',time() + 1800);
+	return 1;
+}
+
+# received pin msg
+sub twitter_oauth_pin_entry {
+	my ($kernel, $pin) = @_[KERNEL, ARG0];
+
+	# clear ask timeout alarm
+	$kernel->alarm('no_pin_received');
+	return $kernel->call($_[SESSION],'oauth_login_finish',$pin);
+}
+
+sub twitter_oauth_login_finish {
+	my ($kernel, $heap, $pin) = @_[KERNEL, HEAP, ARG0];
+
+	# make token ask if pin provided
+	if ($pin) {
+		my ($access_token, $access_token_sec, $user_id, $username) = eval { $heap->{'twitter'}->request_access_token(verifier=>$pin) };
+		if ($@) {
+			if ($@ =~ m/401/) {
+				$kernel->yield('server_reply',510,'Unable to authorize with this PIN. Please try again.');
+			} else {
+				$kernel->yield('server_reply',511,'Unknown error while authorizing. Please try again.');
+			}
+			$kernel->yield('oauth_pin_ask');
+			return;
+		}
+
+		# check if already logged in
+		if (exists $users{$username}) {
+			$kernel->yield('server_reply',436,$username,'You are already connected to Twitter with this username.');
+			$kernel->yield('shutdown');
+			return 1;
+		}
+
+		# store tokens and user info in config for later use.
+		$heap->{'config'}->{'access_token'} = $access_token;
+		$heap->{'config'}->{'access_token_secret'} = $access_token_sec;
+		$heap->{'config'}->{'user_id'} = $user_id;
+		$heap->{'config'}->{'username'} = $username;
+		$heap->{'username'} = $username;
+	}
+
+	# make sure we're happy, otherwise re-try PIN ask
+	unless($heap->{'twitter'}->authorized) {
+		$kernel->post('logger','log','Unable to retrieve access tokens for entered PIN.');
+		$kernel->yield('server_reply',462,'Invalid PIN. Re-check PIN and try again.');
+		$kernel->yield('oauth_pin_ask');
+		return;
+	}
+
+	$kernel->yield('server_reply',399,'PIN accepted.');
+	$kernel->yield('setup_authenticated_user');
+	return 1;
+}
+
+sub tircd_setup_authenticated_user {
+	my ($kernel, $heap) = @_[KERNEL, HEAP];
 
 	#load our configs from disk if they exist
 	if (-d $config{'storage_path'}) {
@@ -321,6 +450,12 @@ sub tircd_login {
 	$heap->{'ua'}->timeout(10);
 	$heap->{'ua'}->env_proxy();
 
+	# allow channel joining
+	$heap->{'authenticated'} = 1;
+
+	#stash the username in a list to keep 'em from rejoining
+	$users{$heap->{'username'}} = 1;
+
 	#some clients need this shit
 	$kernel->yield('server_reply','001',"Welcome to tircd $heap->{'username'}");
 	$kernel->yield('server_reply','002',"Your host is tircd running version $VERSION");
@@ -329,6 +464,16 @@ sub tircd_login {
 
 	#show 'em the motd
 	$kernel->yield('MOTD');  
+}
+
+sub tircd_oauth_no_pin_received {
+	my ($kernel, $heap) = @_[KERNEL, HEAP];
+
+	# we didn't receive a pin in time
+	$kernel->post('logger','log','No PIN entered, disconnecting user: ',$heap->{'username'});
+	$kernel->yield('server_reply',532,'Never received a PIN. Disconnecting');
+	$kernel->yield('shutdown'); #disconnect 'em if we cant
+	return;
 }
 
 sub tircd_verify_ssl {
@@ -386,6 +531,9 @@ sub tircd_connect {
 sub tircd_cleanup {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
   $kernel->post('logger','log',$heap->{'remote_ip'}.' disconnected.',$heap->{'username'});
+
+  # stop the oauth no pin entry alarm
+  $kernel->alarm('no_pin_received');
   
   #delete the username
   delete $users{$heap->{'username'}};
@@ -396,10 +544,9 @@ sub tircd_cleanup {
 
   # if storage_path directory doesn't exist, attempt to create
   unless ( -e $config{'storage_path'} && -d $config{'storage_path'} ) {
-	  mkdir $config{'storage_path'};
-	  if ($!) {
-		  $kernel->post('logger','log','Was unable to create storage_dir at ' . $config{'storage_path'} . '.' . $!);  
-	  }
+	  unless (mkdir ($config{'storage_path'})) {
+		  $kernel->post('logger','log','Was unable to create storage_path at ' . $config{'storage_path'} . ' .' . $!);  
+		}
   }
   
   #if defined, save our data for next time
@@ -535,6 +682,12 @@ sub irc_motd {
 
 sub irc_join {
   my ($kernel, $heap, $data) = @_[KERNEL, HEAP, ARG0];
+
+  unless($heap->{'authenticated'}) {
+	$kernel->yield('server_reply',508,"Unable to join ", $data->{'params'}[0],".");
+	$kernel->yield('server_reply',509,"Connection not yet authorized.");
+	return;
+  }
 
   my @chans = split(/\,/,$data->{'params'}[0]);
   foreach my $chan (@chans) {
@@ -764,7 +917,10 @@ sub irc_stats {
     }
     $kernel->yield('server_reply',212,$key,"Use '/stats <key> <value>' to change a setting.");
     $kernel->yield('server_reply',212,$key,"Example: /stats join_silent 1");
-   } else {
+   } elsif ($key =~ m/pin/i) {
+		$kernel->yield('oauth_pin_entry',$val);
+		return;
+	} else {
     if (exists $heap->{'config'}->{$key}) {
       $heap->{'config'}->{$key} = $val;
       $kernel->yield('server_reply',212,$key,"set to $val");
