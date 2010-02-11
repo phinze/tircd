@@ -1291,10 +1291,10 @@ sub twitter_timeline {
   my $timeline;
   my $error;
   if ($heap->{'timeline_since_id'}) {
-    $timeline = eval { $heap->{'twitter'}->friends_timeline({count => $heap->{'config'}->{'timeline_count'}, since_id => $heap->{'timeline_since_id'}}) };
+    $timeline = eval { $heap->{'twitter'}->home_timeline({count => $heap->{'config'}->{'timeline_count'}, since_id => $heap->{'timeline_since_id'}}) };
     $error = $@;
   } else {
-    $timeline = eval { $heap->{'twitter'}->friends_timeline({count => $heap->{'config'}->{'timeline_count'}}) };
+    $timeline = eval { $heap->{'twitter'}->home_timeline({count => $heap->{'config'}->{'timeline_count'}}) };
     $error = $@;
   }
 
