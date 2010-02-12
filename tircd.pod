@@ -42,9 +42,22 @@ You can specify an alternate path to the configuration file on the commandline i
 
 By default, tircd listens on localhost port 6667.
 
-When connecting to tircd, you must ensure that your NICK is set to your twitter username, and that you send PASS with your twitter password.
+There are two modes of authentication for connecting tircd to twitter. Basic authentication is the old style where you provide tircd with your twitter username and password, and it authenticates you against the twitter api service normally. OAuth authentication is a 3-way handshake involving where tircd will present you with an authentication URL hosted by twitter and allows you to manage tircd's access to your account through twitters OAuth system.
+
+The main difference between OAuth and Basic authentication is that using OAuth you never have to expose your login and password to the tircd daemon, nor worry about it sending your credentials in plain text if you are not using SSL.
+
+=item Connecting with Basic Authentication
+
+Connect to tircd, using your twitter username as your NICK. Send your twitter password with the PASS command.
 
 With many irc clients you can do this by issuing the command /SERVER [hostname running tircd] 6667 <your twitter password> <your twitter username>.   Check your client's documentation for the appropirate syntax.
+
+=item Connecting with OAuth Authentication
+
+Connect to tircd with the username of "oauth". Tircd will make a challenege to twitter, and twitter will provide a link to tircd for you to authorize the connection. Follow the link, make sure you are logged into twitter as the user you wish to use tircd as, and then click Allow to allow the connection. Twitter will then present you with a PIN number. To complete your connection to tircd, type: /stats pin <PIN NUMBER>. On some clients that honor the irc protocol and do not expect you to be sending a stats command before connecting you may have to type: /quote stats pin <PIN NUMBER>. Tircd will then attempt to authorize the connection using the provided PIN.
+
+
+=item After connecting
 
 Once connected JOIN #twitter to get started.  The channel #twitter is where you will perform most opertions
 
