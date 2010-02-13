@@ -1344,35 +1344,65 @@ sub twitter_timeline {
   #loop through each message
   foreach my $item (sort {$a->{'id'} <=> $b->{'id'}} values %tmphash) {
     my $tmp = $item->{'user'};
+    my $is_following = ();
     $tmp->{'status'} = $item;
     
     if (my $friend = $kernel->call($_[SESSION],'getfriend',$item->{'user'}->{'screen_name'})) { #if we've seen 'em before just update our cache
       $kernel->call($_[SESSION],'updatefriend',$tmp);
-    } else { #if it's a new user, add 'em to the cache / and join 'em
-      push(@{$heap->{'friends'}},$tmp);
-      
-      #removed the fake join tempoarily while, I figure out the better way to handle this.  I think the best is to leave it like this and treat the channels as if they are -n
-      #$kernel->yield('user_msg','JOIN',$item->{'user'}->{'screen_name'},'#twitter');
-      #if ($kernel->call($_[SESSION],'getfollower',$item->{'user'}->{'screen_name'})) {
-      #  $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '+';
-      #  $kernel->yield('server_reply','MODE','#twitter','+v',$item->{'user'}->{'screen_name'});
-      #} else {
-      #  $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '';
-      #}
+    } else { 
+      # removed the fake join tempoarily while, I figure out the better way to handle this.  I think the best is to leave it like this and treat the channels as if they are -n
+      # Olatho - Re enabled this - fixes the bug where you do not see tweets from people you add from other clients.
+      # But there is a problem here.
+      # If you are not following the user, and they mention you, they are joining the channel, and you can't /invite later..
+      # Adding a fake part again imediately if they are not a friend, to make it clear what happens
+      # Also, only adding them to 'friends' if they really are friends
+
+      $kernel->post('logger','log','Getting userinfo for ' . $item->{'user'}->{'screen_name'},$heap->{'username'});
+      $is_following = eval { $heap->{'twitter'}->show_user($item->{'user'}->{'screen_name'}) };
+      $kernel->post('logger','log','Got name: ' . $is_following->{'name'} . ' following: ' . $is_following->{'following'}, $heap->{'username'});
+      if ($is_following->{'following'} == 1) {
+	# We are following this user, add to 'friends'
+        push(@{$heap->{'friends'}},$tmp);
+      }
+      # Join them to #twitter
+      $kernel->yield('user_msg','JOIN',$item->{'user'}->{'screen_name'},'#twitter');
+      # Check if they should have voice (+v)
+      if ($kernel->call($_[SESSION],'getfollower',$item->{'user'}->{'screen_name'})) {
+        $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '+';
+        $kernel->yield('server_reply','MODE','#twitter','+v',$item->{'user'}->{'screen_name'});
+      } else {
+        $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}} = '';
+      }
     }
     
-    #filter out our own messages / don't display if not in silent mode
+    # filter out our own messages / don't display if not in silent mode
+    # Olatho - Don't understand what the original code tried to do, but my changes tries to do the right thing
+    # This will lead to seeing messages twice if you are tweeting actively, as messages are parsed both when you tweet, and when tircd receives the updates
+    # But I prefer that instead of missing messages I add from other clients
+    # This can be fixed by using a global buffer/cache to filter out the messages, not just the latest topic
     if (($item->{'user'}->{'screen_name'} ne lc($heap->{'username'}) || !$heap->{'config'}->{'filter_self'})) {
       if (!$silent) {
         foreach my $chan (keys %{$heap->{'channels'}}) {
-          if ($chan eq '#twitter' || exists $heap->{'channels'}->{$chan}->{'names'}->{$item->{'user'}->{'screen_name'}}) {
+          # - Send the message to the #twitter-channel if it is different from my latest update (IE different from current topic)
+          if ($chan eq '#twitter' && exists $heap->{'channels'}->{$chan}->{'names'}->{$item->{'user'}->{'screen_name'}} && $item->{'text'} ne $heap->{'channels'}->{$chan}->{'topic'}) {
             $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},$chan,$item->{'text'});
           }
-          if ($item->{'user'}->{'screen_name'} eq $heap->{'username'}) {
+          # - Send the message to the other channels the user is in if the user is not "me"
+          if ($chan ne '#twitter' && exists $heap->{'channels'}->{$chan}->{'names'}->{$item->{'user'}->{'screen_name'}} && $item->{'user'}->{'screen_name'} ne $heap->{'username'}) {
+            $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},$chan,$item->{'text'});
+          }
+          # - And set topic on the #twitter channel if user is me and the topic is not already set 
+          if ($chan eq '#twitter' && $item->{'user'}->{'screen_name'} eq $heap->{'username'} && $item->{'text'} ne $heap->{'channels'}->{$chan}->{'topic'}) {
             $kernel->yield('user_msg','TOPIC',$heap->{'username'},$chan,"$heap->{'username'}'s last update: ".$item->{'text'});
+            $heap->{'channels'}->{$chan}->{'topic'} = $item->{'text'};
           }            
         }          
       }        
+    }
+    if (($is_following->{'status'}) && ($is_following->{'following'} == 0)) {
+      # If we are not following them - have them part #twitter again
+      $kernel->yield('user_msg','PART',$item->{'user'}->{'screen_name'},'#twitter');
+      delete $heap->{'channels'}->{'#twitter'}->{'names'}->{$item->{'user'}->{'screen_name'}};
     }
   }
 
