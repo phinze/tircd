@@ -15,6 +15,8 @@ use LWP::UserAgent;
 use Storable;
 use POE qw(Component::Server::TCP Filter::Stackable Filter::Map Filter::IRCD);
 use URI qw/host/;
+# @Olatho - issue 45
+use HTML::Entities;
 
 my $VERSION = 0.8;
 # consumer key/secret in the executable instead of config because it should not be edited by user
@@ -65,9 +67,8 @@ $filter->push( POE::Filter::Line->new( InputRegexp => '\015?\012', OutputLiteral
 #twitter's json feed escapes < and >, let's fix that
 $filter->push( POE::Filter::Map->new(Code => sub {
   local $_ = shift;
-  s/\&lt\;/\</g;
-  s/\&gt\;/\>/g;
-  s/\&quot\;/\"/g;
+  # @Olatho - Issue 45 - see also issue 50
+  decode_entities($_);
   return $_;
 }));
 if ($config{'debug'} > 1) {
