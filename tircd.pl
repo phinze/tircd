@@ -1021,6 +1021,9 @@ sub irc_privmsg {
     
     #keep the topic updated with our latest tweet  
     $kernel->yield('user_msg','TOPIC',$heap->{'username'},$target,"$heap->{'username'}'s last update: $msg");
+    # Olatho - Fixing duplicate topic-changes
+    $heap->{'channels'}->{$target}->{'topic'} = $msg;
+
     $kernel->post('logger','log','Updated status.',$heap->{'username'});
   } else { 
     #private message, it's a dm
