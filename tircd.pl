@@ -208,12 +208,17 @@ sub twitter_api_error {
     $kernel->post('logger','log',$error->message().' '.$error->code().' '.$error,'debug/twitter_api_error');
   }
 
-  $kernel->post('logger','log',$msg.' ('.$error->code() .' from Twitter API).',$heap->{'username'});  
+  if ($error ne ''){
+    $kernel->post('logger','log',$msg.' ('.$error->code() .' from Twitter API).',$heap->{'username'});  
 
-  if ($error->code() == 400) {
-    $msg .= ' Twitter API limit reached.';
+    if ($error->code() == 400) {
+      $msg .= ' Twitter API limit reached.';
+    } else {
+      $msg .= ' Twitter Fail Whale.';
+    }
   } else {
-    $msg .= ' Twitter Fail Whale.';
+    $kernel->post('logger','log',$msg.' (unknown from Twitter API).',$heap->{'username'});  
+    $msg .= ' Twitter Unknown Fail Whale.';
   }
   $kernel->yield('server_reply',461,'#twitter',$msg);
 }
